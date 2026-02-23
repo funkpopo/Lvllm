@@ -1612,8 +1612,7 @@ class FusedMoE(CustomOp):
             return 
         return (not torch.cuda.is_current_stream_capturing() and 
                 self.is_gpu_prefill_layer and 
-                hidden_states.size(0) >= get_gpu_prefill_min_batch_size() and
-                not is_in_profile_run())
+                hidden_states.size(0) >= get_gpu_prefill_min_batch_size())
                 
             
     def _get_ggml_type_from_quant_config(self,  quant_config, layer_idx, weight_type):  
