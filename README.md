@@ -21,6 +21,7 @@ Lvllm uses the latest vLLM source code and has redesigned and implemented MOE mo
 - [Performance Reference](#performance-reference)
 - [How to Run Qwen3.5](#how-to-run-qwen35)
 - [How to Run MiniMax-M2.5](#how-to-run-minimax-m25)
+- [How to Run Kimi-K2.5](#how-to-run-kimi-k25)
 - [Configuration Parameters](#configuration-parameters)
 - [Installation Steps](#installation-steps)
 - [Update](#update)
@@ -189,6 +190,50 @@ vllm serve \
 ```bash 
 --enable_expert_parallel # enable expert parallelism, 8-card inference of minimax-m2.1 model requires setting
 ```
+
+## How to Run Kimi-K2.5
+
+```bash
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+free -h
+
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+VLLM_TEST_FORCE_FP8_MARLIN=1 \
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 \
+OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_MOE_QUANT_ON_GPU=1 \
+vllm serve \
+    --model /home/guqiong/Models/Kimi-K2.5 \
+    --host 0.0.0.0 \
+    --port 8070 \
+    --tensor-parallel-size 2 \
+    --max-model-len 16384 \
+    --gpu-memory-utilization 0.80 \
+    --trust-remote-code \
+    --tokenizer-mode auto \
+    --swap-space 0 \
+    --served-model-name Kimi-K2.5 \
+    --compilation_config.cudagraph_mode FULL_AND_PIECEWISE \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --max-num-batched-tokens 2048 \
+    --dtype bfloat16 \
+    --max-num-seqs 4 \
+    --compilation_config.mode VLLM_COMPILE \
+    --enable-auto-tool-choice \
+    --tool-call-parser kimi_k2 \
+    --reasoning-parser kimi_k2 
+
+```
+
 
 | Environment Variable | Type | Default Value | Description | Notes |
 |--------|------|--------|------|------|
