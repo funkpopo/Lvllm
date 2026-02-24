@@ -233,7 +233,7 @@ vllm serve \
     --reasoning-parser kimi_k2 
 
 ```
-
+## Configuration Parameters
 
 | Environment Variable | Type | Default Value | Description | Notes |
 |--------|------|--------|------|------|
@@ -248,7 +248,7 @@ vllm serve \
 | `LVLLM_ENABLE_NUMA_INTERLEAVE` | Performance Parameter | 0 | `0`：load model quickly, `1`：load model slowly to avoid OOM | Suggested value: use `0` when memory is abundant, use `1` when memory is tight |
 | `LVLLM_MOE_QUANT_ON_GPU` | Performance Parameter | 0 | `0`：enable CPU expert quantization, `1`：enable GPU expert quantization | enable if GPU memory is abundant (only effective at loading time, inference will not occupy extra GPU memory)，accelerate model loading speed |
 
-## Configuration Parameters
+
 
 | Parameter | Example Value | Description |
 |-----------|-------|-------------|
