@@ -19,7 +19,8 @@ Lvllm uses the latest vLLM source code and has redesigned and implemented MOE mo
 - [Version Changes](#version-changes)
 - [Supported Models](#supported-models)
 - [Performance Reference](#performance-reference)
-- [How to Run Qwen3.5](#how-to-run-qwen35)
+- [How to Run Qwen3.5-122B-A10B](#how-to-run-qwen35-122b-a10b)
+- [How to Run Qwen3.5-397B-A17B](#how-to-run-qwen35-397b-a17b)
 - [How to Run MiniMax-M2.5](#how-to-run-minimax-m25)
 - [How to Run Kimi-K2.5](#how-to-run-kimi-k25)
 - [Configuration Parameters](#configuration-parameters)
@@ -56,6 +57,7 @@ Most of the original MOE models verified by vLLM
 
 | Model Name | Status |
 |---------|------|
+| Qwen3.5-122B-A10B | ✅ Tested |
 | Qwen3.5-397B-A17B | ✅ Tested |
 | Qwen3-Coder-Next | ✅ Tested |
 | Qwen3-Next-80B-A3B-Instruct | ✅ Tested |
@@ -97,10 +99,62 @@ Note 1: https://hf-mirror.com/cyankiwi provides AWQ 4bit symmetric quantized mod
 
 Note 1: Enabling GPU Prefill, Input Length 32K-64K
 
-## How to Run Qwen3.5
+
+## How to Run Qwen3.5-122B-A10B
 ```bash
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
+
+pip uninstall transformers
+pip install transformers==4.57.6
+
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+VLLM_TEST_FORCE_FP8_MARLIN=1 \
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 \
+OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_GPU_RESIDENT_MOE_LAYERS=0 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_MOE_QUANT_ON_GPU=0 \
+vllm serve \
+    --model /home/guqiong/Models/Qwen3.5-122B-A10B \
+    --host 0.0.0.0 \
+    --port 8070 \
+    --tensor-parallel-size 2 \
+    --max-model-len 40000 \
+    --gpu-memory-utilization 0.80 \
+    --trust-remote-code \
+    --tokenizer-mode auto \
+    --swap-space 0 \
+    --served-model-name Qwen3.5-122B-A10B \
+    --compilation_config.cudagraph_mode FULL_DECODE_ONLY \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --max-num-batched-tokens 16384 \
+    --max-num-seqs 4 \
+    --compilation_config.mode VLLM_COMPILE \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --language-model-only
+```
+
+
+## How to Run Qwen3.5-397B-A17B
+```bash
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+free -h
+
+pip uninstall transformers
+pip install transformers==4.57.6
 
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 VLLM_TEST_FORCE_FP8_MARLIN=1 \
@@ -145,6 +199,10 @@ vllm serve \
 
  
 ```bash
+
+pip uninstall transformers
+pip install transformers==4.57.6
+
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 VLLM_TEST_FORCE_FP8_MARLIN=1 \
 NCCL_SOCKET_IFNAME=lo \
@@ -196,6 +254,9 @@ vllm serve \
 ```bash
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
+
+pip uninstall transformers
+pip install transformers==4.57.6
 
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 VLLM_TEST_FORCE_FP8_MARLIN=1 \
