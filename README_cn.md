@@ -105,8 +105,8 @@ vLLM已验证的大部分原版MOE模型
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
-pip uninstall transformers -y
-pip install transformers==4.57.6
+pip uninstall transformers flashinfer-cubin -y
+pip install transformers==4.57.6 flashinfer-cubin==0.6.4
 
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 VLLM_TEST_FORCE_FP8_MARLIN=1 \
