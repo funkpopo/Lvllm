@@ -417,6 +417,7 @@ pip install -r requirements/build.txt
 MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e . --no-build-isolation -vvv
 
 rm -rf ~/.cache/vllm
+rm -rf ~/.cache/flashinfer
 ```  
  
 ## Optimization Tips
