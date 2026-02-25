@@ -105,7 +105,7 @@ vLLM已验证的大部分原版MOE模型
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
-pip uninstall transformers
+pip uninstall transformers -y
 pip install transformers==4.57.6
 
 PYTORCH_ALLOC_CONF=expandable_segments:True \
@@ -153,7 +153,7 @@ vllm serve \
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
-pip uninstall transformers
+pip uninstall transformers -y
 pip install transformers==4.57.6
 
 PYTORCH_ALLOC_CONF=expandable_segments:True \
@@ -200,7 +200,7 @@ vllm serve \
 
 ```bash
 
-pip uninstall transformers
+pip uninstall transformers -y
 pip install transformers==4.57.6
 
 PYTORCH_ALLOC_CONF=expandable_segments:True \
@@ -255,7 +255,7 @@ vllm serve \
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
 
-pip uninstall transformers
+pip uninstall transformers -y
 pip install transformers==4.57.6
 
 PYTORCH_ALLOC_CONF=expandable_segments:True \
