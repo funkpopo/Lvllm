@@ -235,6 +235,16 @@ class DefaultMoERunner(MoERunner):
             or self.moe_config.moe_parallel_config.use_fi_all2allv_kernels
         ) and envs.VLLM_ENABLE_MOE_DP_CHUNK
 
+    @staticmethod
+    def _should_use_lk_moe_path(
+        layer: torch.nn.Module, hidden_states: torch.Tensor
+    ) -> bool:
+        return (
+            not layer.is_gpu_resident_layer
+            and getattr(layer, "lk_moe", None) is not None
+            and not layer.should_use_gpu_prefill(hidden_states)
+        )
+
     def _maybe_setup_shared_experts_stream(
         self,
         hidden_states: torch.Tensor,
@@ -502,7 +512,7 @@ class DefaultMoERunner(MoERunner):
             # Matrix multiply.
             if self.quant_method.is_monolithic:
                 assert has_separate_shared_experts or self.shared_experts is None
-                if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
+                if self._should_use_lk_moe_path(layer, hidden_states):
                     topk_weights, topk_ids = self.router.select_experts(
                         hidden_states=staged_hidden_states,
                         router_logits=staged_router_logits,
@@ -524,7 +534,12 @@ class DefaultMoERunner(MoERunner):
                     hidden_states=staged_hidden_states,
                     router_logits=staged_router_logits,
                 )
-                if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
+                if self._should_use_lk_moe_path(layer, hidden_states):
+                    local_topk_ids = (
+                        layer.global_to_local_expert_ids(topk_ids)
+                        if layer.use_ep
+                        else topk_ids
+                    )
                     final_hidden_states = layer.forward_lk(
                         staged_hidden_states,
                         topk_weights, 
@@ -727,7 +742,7 @@ class DefaultMoERunner(MoERunner):
 
             # Matrix multiply.
             if self.quant_method.is_monolithic:
-                if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
+                if self._should_use_lk_moe_path(layer, hidden_states):
                     topk_weights, topk_ids = self.router.select_experts(
                         hidden_states=x,
                         router_logits=router_logits,
@@ -749,7 +764,7 @@ class DefaultMoERunner(MoERunner):
                     hidden_states=x_orig,
                     router_logits=router_logits,
                 )
-                if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
+                if self._should_use_lk_moe_path(layer, hidden_states):
                     local_topk_ids = layer.global_to_local_expert_ids(topk_ids) if layer.use_ep else topk_ids
                     final_hidden_states = layer.forward_lk(
                         x,
@@ -821,6 +836,9 @@ def moe_cleanup(layer, layer_name: str, hidden_states: torch.Tensor,
     
     if hidden_states.size(0) < get_gpu_prefill_min_batch_size():
         return
+
+    if getattr(layer, "lk_moe", None) is None:
+        return
     
     if not layer.should_use_gpu_prefill(hidden_states):
         return
@@ -865,6 +883,9 @@ def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor,
         return
     
     if hidden_states.size(0) < get_gpu_prefill_min_batch_size():
+        return
+
+    if getattr(layer, "lk_moe", None) is None:
         return
     
     if not layer.should_use_gpu_prefill(hidden_states):
@@ -1178,6 +1199,8 @@ def moe_clean_gpu_prefill(layer):
 def moe_wait_prefetch(layer, hidden_states: torch.Tensor, forward_context: ForwardContext):
     if torch.cuda.is_current_stream_capturing():
         return 
+    if getattr(layer, "lk_moe", None) is None:
+        return
     if not hasattr(forward_context, '_prefetch_events'):
         return 
     if not layer.should_use_gpu_prefill(hidden_states):
