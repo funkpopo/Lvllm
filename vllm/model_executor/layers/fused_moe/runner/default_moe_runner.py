@@ -39,7 +39,13 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 logger = init_logger(__name__)
 from vllm.utils.platform_utils import is_pin_memory_available
 
-from vllm.envs import is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, is_lk_moe_quant_on_gpu
+from vllm.envs import (
+    get_gpu_prefetch_window,
+    get_gpu_prefill_min_batch_size,
+    is_lk_moe_gpu_resident_layer_idx,
+    is_lk_moe_quant_on_gpu,
+    is_lk_moe_use_gpu_prefill,
+)
 def get_layer_from_name(layer_name: str) -> torch.nn.Module:
     forward_context: ForwardContext = get_forward_context()
     if layer_name == "from_forward_context":
@@ -859,7 +865,7 @@ def moe_cleanup(layer, layer_name: str, hidden_states: torch.Tensor,
     
     for k in keys_to_clean: 
         candidate_name = layer_name.replace(f".{layer_idx}.", f".{k}.")
-        if is_lk_moe_gpu_resident_layer(candidate_name):
+        if is_lk_moe_gpu_resident_layer_idx(k):
             del state[k]
             continue  
         layer_obj = forward_context.no_compile_layers.get(candidate_name)
@@ -924,8 +930,7 @@ def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor,
             
     active_prefetches = 0
     for k in state.keys():
-        candidate_name = layer_name.replace(f".{layer_idx}.", f".{k}.")
-        if not is_lk_moe_gpu_resident_layer(candidate_name):
+        if not is_lk_moe_gpu_resident_layer_idx(k):
             active_prefetches += 1
      
     available_slots = gpu_prefetch_window - active_prefetches
@@ -940,7 +945,7 @@ def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor,
             if candidate_name not in forward_context.no_compile_layers:
                 break  
              
-            if is_lk_moe_gpu_resident_layer(candidate_name):
+            if is_lk_moe_gpu_resident_layer_idx(candidate_idx):
                 continue
              
             if candidate_idx not in state and len(prefetch_candidates) < available_slots:
