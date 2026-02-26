@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import OrderedDict
 from contextlib import nullcontext
+import weakref
 
 import torch
 import torch.nn.functional as F
@@ -41,11 +43,14 @@ from vllm.utils.platform_utils import is_pin_memory_available
 
 from vllm.envs import (
     get_gpu_prefetch_window,
+    get_gpu_prefill_lru_cache_size,
     get_gpu_prefill_min_batch_size,
     is_lk_moe_gpu_resident_layer_idx,
     is_lk_moe_quant_on_gpu,
     is_lk_moe_use_gpu_prefill,
 )
+
+
 def get_layer_from_name(layer_name: str) -> torch.nn.Module:
     forward_context: ForwardContext = get_forward_context()
     if layer_name == "from_forward_context":
@@ -832,6 +837,144 @@ class DefaultMoERunner(MoERunner):
             
 
 from vllm.envs import extract_layer_index    
+_gpu_prefill_layer_lru_cache: dict[
+    tuple[int, int], OrderedDict[int, weakref.ReferenceType[torch.nn.Module]]
+] = {}
+
+
+def _get_prefill_cache_key(forward_context: ForwardContext) -> tuple[int, int]:
+    # Key by (device, model static layer registry) so cache survives across
+    # ForwardContext instances but does not mix different models.
+    return (torch.cuda.current_device(), id(forward_context.no_compile_layers))
+
+
+def _get_prefill_layer_cache(
+    forward_context: ForwardContext,
+) -> OrderedDict[int, weakref.ReferenceType[torch.nn.Module]]:
+    cache_key = _get_prefill_cache_key(forward_context)
+    cache = _gpu_prefill_layer_lru_cache.get(cache_key)
+    if cache is None:
+        cache = OrderedDict()
+        _gpu_prefill_layer_lru_cache[cache_key] = cache
+    return cache
+
+
+def _prune_dead_prefill_cache_entries(
+    cache: OrderedDict[int, weakref.ReferenceType[torch.nn.Module]],
+) -> None:
+    stale_layer_ids = [layer_id for layer_id, layer_ref in cache.items() if layer_ref() is None]
+    for layer_id in stale_layer_ids:
+        cache.pop(layer_id, None)
+
+
+def _touch_prefill_cache(layer: torch.nn.Module, forward_context: ForwardContext) -> bool:
+    cache = _get_prefill_layer_cache(forward_context)
+    _prune_dead_prefill_cache_entries(cache)
+    layer_id = id(layer)
+    layer_ref = cache.get(layer_id)
+    if layer_ref is None:
+        return False
+    if layer_ref() is None:
+        cache.pop(layer_id, None)
+        return False
+    cache.move_to_end(layer_id)
+    return True
+
+
+def _drop_layer_from_batch_prefetch_states(
+    forward_context: ForwardContext, layer_id: int
+) -> None:
+    if not hasattr(forward_context, "_batch_prefetch_states"):
+        return
+
+    for batch_state in forward_context._batch_prefetch_states.values():
+        state = batch_state.get("state")
+        if not isinstance(state, dict):
+            continue
+
+        stale_layer_indices = [
+            layer_idx
+            for layer_idx, cached_layer_id in state.items()
+            if cached_layer_id == layer_id
+        ]
+        for layer_idx in stale_layer_indices:
+            state.pop(layer_idx, None)
+
+
+def _pop_prefetch_event(
+    forward_context: ForwardContext, layer_id: int, wait: bool
+) -> None:
+    if not hasattr(forward_context, "_prefetch_events"):
+        return
+
+    event = forward_context._prefetch_events.pop(layer_id, None)
+    if wait and event is not None:
+        event.synchronize()
+
+
+def _get_prefill_lru_cache_capacity(gpu_prefetch_window: int) -> int:
+    configured_size = get_gpu_prefill_lru_cache_size()
+    if configured_size > 0:
+        return max(configured_size, gpu_prefetch_window)
+    # Keep default conservative to avoid excessive VRAM growth.
+    return max(4, gpu_prefetch_window)
+
+
+def _get_active_prefetch_layer_ids(forward_context: ForwardContext) -> set[int]:
+    active_layer_ids: set[int] = set()
+    if not hasattr(forward_context, "_batch_prefetch_states"):
+        return active_layer_ids
+
+    for batch_state in forward_context._batch_prefetch_states.values():
+        state = batch_state.get("state")
+        if not isinstance(state, dict):
+            continue
+        for layer_id in state.values():
+            if isinstance(layer_id, int):
+                active_layer_ids.add(layer_id)
+    return active_layer_ids
+
+
+def _insert_prefill_cache_entry_with_lru_evict(
+    layer: torch.nn.Module,
+    forward_context: ForwardContext,
+    max_cache_size: int,
+) -> None:
+    cache = _get_prefill_layer_cache(forward_context)
+    _prune_dead_prefill_cache_entries(cache)
+
+    layer_id = id(layer)
+    cache[layer_id] = weakref.ref(layer)
+    cache.move_to_end(layer_id)
+
+    protected_layer_ids = _get_active_prefetch_layer_ids(forward_context)
+    protected_layer_ids.add(layer_id)
+
+    while len(cache) > max_cache_size:
+        evicted_any = False
+        for evict_layer_id, evict_layer_ref in list(cache.items()):
+            if evict_layer_id in protected_layer_ids:
+                cache.move_to_end(evict_layer_id)
+                continue
+
+            cache.pop(evict_layer_id, None)
+
+            # Ensure no pending prefetch writes are still in flight before
+            # freeing.
+            _pop_prefetch_event(forward_context, evict_layer_id, wait=True)
+            _drop_layer_from_batch_prefetch_states(forward_context, evict_layer_id)
+
+            evict_layer = evict_layer_ref()
+            if evict_layer is not None:
+                moe_clean_gpu_prefill(evict_layer)
+
+            evicted_any = True
+            break
+        if not evicted_any:
+            # All cache entries are currently active in this batch.
+            break
+
+
 def moe_cleanup(layer, layer_name: str, hidden_states: torch.Tensor, 
                 forward_context: ForwardContext): 
     if torch.cuda.is_current_stream_capturing():
@@ -860,23 +1003,13 @@ def moe_cleanup(layer, layer_name: str, hidden_states: torch.Tensor,
     
     batch_state = forward_context._batch_prefetch_states[batch_key]
     state = batch_state['state']
-     
-    keys_to_clean = [k for k in state.keys() if k <= layer_idx]
-    
-    for k in keys_to_clean: 
-        candidate_name = layer_name.replace(f".{layer_idx}.", f".{k}.")
-        if is_lk_moe_gpu_resident_layer_idx(k):
-            del state[k]
-            continue  
-        layer_obj = forward_context.no_compile_layers.get(candidate_name)
-        if layer_obj:
-            moe_clean_gpu_prefill(layer_obj)
-        del state[k]
-        if hasattr(forward_context, '_prefetch_events'):  
-            if layer_obj:
-                layer_id = id(layer_obj)
-                if layer_id in forward_context._prefetch_events:
-                    del forward_context._prefetch_events[layer_id]
+
+    keys_to_release = [k for k in state.keys() if k <= layer_idx]
+    for k in keys_to_release:
+        layer_id = state.pop(k, None)
+        # Clear stale events; cached layers stay resident until LRU eviction.
+        if isinstance(layer_id, int):
+            _pop_prefetch_event(forward_context, layer_id, wait=False)
         
 
 
@@ -911,13 +1044,14 @@ def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor,
     
     if batch_key not in forward_context._batch_prefetch_states:
         forward_context._batch_prefetch_states[batch_key] = {
-            'state': {},  # layer_idx -> prefetch_count
+            'state': {},  # layer_idx -> layer_id (prefetched for this batch)
             'called_layers': set()
         }
     
     batch_state = forward_context._batch_prefetch_states[batch_key]
     state = batch_state['state']
     called_layers = batch_state['called_layers']
+    lru_cache_capacity = _get_prefill_lru_cache_capacity(gpu_prefetch_window)
      
     if layer_idx == 0:
         state.clear()
@@ -927,6 +1061,22 @@ def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor,
         return
     
     called_layers.add(layer_name)  
+
+    # Mark current layer as recently used if already cached.
+    current_layer_cached = _touch_prefill_cache(layer, forward_context)
+
+    # Current layer must be ready before forward; if it was not prefetched and is
+    # not resident, stage it immediately.
+    if (
+        not current_layer_cached
+        and not is_lk_moe_gpu_resident_layer_idx(layer_idx)
+        and layer_idx not in state
+    ):
+        moe_prepare_gpu_prefill(layer, forward_context, torch.cuda.current_device())
+        _insert_prefill_cache_entry_with_lru_evict(
+            layer, forward_context, lru_cache_capacity
+        )
+        state[layer_idx] = id(layer)
             
     active_prefetches = 0
     for k in state.keys():
@@ -948,14 +1098,28 @@ def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor,
             if is_lk_moe_gpu_resident_layer_idx(candidate_idx):
                 continue
              
-            if candidate_idx not in state and len(prefetch_candidates) < available_slots:
-                candidate_layer = forward_context.no_compile_layers.get(candidate_name)
-                if candidate_layer:
-                    prefetch_candidates.append((candidate_idx, candidate_layer))
+            if candidate_idx in state:
+                continue
+
+            candidate_layer = forward_context.no_compile_layers.get(candidate_name)
+            if candidate_layer is None:
+                continue
+
+            # Cache hit: no extra H2D transfer needed, just refresh LRU recency.
+            if _touch_prefill_cache(candidate_layer, forward_context):
+                continue
+
+            if len(prefetch_candidates) < available_slots:
+                prefetch_candidates.append((candidate_idx, candidate_layer))
+                if len(prefetch_candidates) >= available_slots:
+                    break
          
         for idx, layer_obj in prefetch_candidates:
             moe_prepare_gpu_prefill(layer_obj, forward_context, torch.cuda.current_device())
-            state[idx] = 1   
+            _insert_prefill_cache_entry_with_lru_evict(
+                layer_obj, forward_context, lru_cache_capacity
+            )
+            state[idx] = id(layer_obj)
             
 def collect_weight_from_moe(layer, param_name: str) -> torch.Tensor:
     pin_memory = is_pin_memory_available()

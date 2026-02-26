@@ -224,6 +224,7 @@ if TYPE_CHECKING:
     LVLLM__MOE_WEIGHTS: bool = False
     LVLLM_GPU_PREFILL_MIN_BATCH_SIZE: int = 0
     LVLLM_GPU_PREFETCH_WINDOW: int = 1
+    LVLLM_GPU_PREFILL_LRU_CACHE_SIZE: int = 0
     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
@@ -1574,6 +1575,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "LVLLM_GPU_PREFETCH_WINDOW": lambda: int(
         os.getenv("LVLLM_GPU_PREFETCH_WINDOW", "3")
     ),
+    # LRU cache size for prefetched MOE weights in GPU prefill path.
+    # 0 means auto-select (currently max(4, LVLLM_GPU_PREFETCH_WINDOW)).
+    "LVLLM_GPU_PREFILL_LRU_CACHE_SIZE": lambda: int(
+        os.getenv("LVLLM_GPU_PREFILL_LRU_CACHE_SIZE", "0")
+    ),
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
@@ -1769,6 +1775,7 @@ def compile_factors() -> dict[str, object]:
         "LVLLM_MOE_USE_WEIGHT",
         "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE",
         "LVLLM_GPU_PREFETCH_WINDOW",
+        "LVLLM_GPU_PREFILL_LRU_CACHE_SIZE",
         "LVLLM_ENABLE_NUMA_INTERLEAVE",
         "LVLLM_MOE_QUANT_ON_GPU",
     }
@@ -1873,6 +1880,10 @@ def get_moe_compute_strategy() -> MoeComputeStrategy:
 
 def get_gpu_prefetch_window() -> int:
     return environment_variables["LVLLM_GPU_PREFETCH_WINDOW"]()
+
+
+def get_gpu_prefill_lru_cache_size() -> int:
+    return environment_variables["LVLLM_GPU_PREFILL_LRU_CACHE_SIZE"]()
 
 def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
     """
