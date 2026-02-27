@@ -1634,18 +1634,24 @@ class FusedMoE(CustomOp):
     
     def should_use_gpu_prefill(self, hidden_states: torch.Tensor) -> bool:
         from vllm.forward_context import (
-            ForwardContext,
             get_forward_context,
             is_forward_context_available,
         )
         from vllm.config import CUDAGraphMode
-        forward_context = get_forward_context()
-        if (hasattr(forward_context, 'cudagraph_runtime_mode') and 
-            forward_context.cudagraph_runtime_mode != CUDAGraphMode.NONE):
-            return 
-        return (not torch.cuda.is_current_stream_capturing() and 
-                self.is_gpu_prefill_layer and 
-                hidden_states.size(0) >= get_gpu_prefill_min_batch_size())
+        # Keep behavior explicit and stable: GPU prefill is disabled whenever
+        # cudagraph runtime mode is active.
+        if is_forward_context_available():
+            forward_context = get_forward_context()
+            if (
+                hasattr(forward_context, "cudagraph_runtime_mode")
+                and forward_context.cudagraph_runtime_mode != CUDAGraphMode.NONE
+            ):
+                return False
+        return bool(
+            (not torch.cuda.is_current_stream_capturing())
+            and self.is_gpu_prefill_layer
+            and hidden_states.size(0) >= get_gpu_prefill_min_batch_size()
+        )
                 
             
     def _get_ggml_type_from_quant_config(self,  quant_config, layer_idx, weight_type):  
