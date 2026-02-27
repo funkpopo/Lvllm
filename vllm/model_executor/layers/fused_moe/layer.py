@@ -3,8 +3,10 @@
 
 from collections.abc import Callable, Iterable
 from enum import Enum
+import time
 from typing import Literal, cast, get_args, overload
 
+from prometheus_client import Counter, Histogram
 import torch
 from torch.nn.parameter import UninitializedParameter
 
@@ -59,6 +61,37 @@ import threading
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.envs import MoeComputeStrategy
 from vllm.envs import is_lk_moe_feature_enabled, get_moe_compute_strategy, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, is_lk_moe_quant_on_gpu, is_in_profile_run
+
+_lk_moe_cpu_kernel_time_seconds = Histogram(
+    name="vllm:lk_moe_cpu_kernel_time_seconds",
+    documentation="Wall-clock execution time of lk_moe CPU kernel path.",
+    buckets=[0.0005, 0.001, 0.0025, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5],
+)
+_lk_moe_h2d_bytes_total = Counter(
+    name="vllm:lk_moe_h2d_bytes_total",
+    documentation="Total bytes transferred from host to device in lk_moe path.",
+)
+_lk_moe_d2h_bytes_total = Counter(
+    name="vllm:lk_moe_d2h_bytes_total",
+    documentation="Total bytes transferred from device to host in lk_moe path.",
+)
+
+
+def _record_h2d_bytes(*tensors: torch.Tensor) -> None:
+    total_bytes = 0
+    for tensor in tensors:
+        total_bytes += tensor.numel() * tensor.element_size()
+    if total_bytes > 0:
+        _lk_moe_h2d_bytes_total.inc(float(total_bytes))
+
+
+def _record_d2h_bytes(*tensors: torch.Tensor) -> None:
+    total_bytes = 0
+    for tensor in tensors:
+        total_bytes += tensor.numel() * tensor.element_size()
+    if total_bytes > 0:
+        _lk_moe_d2h_bytes_total.inc(float(total_bytes))
+
 if is_lk_moe_feature_enabled():
     import  lk_moe
     GGML_TYPE_TO_TORCH_DTYPE = {
@@ -2804,10 +2837,16 @@ class FusedMoE(CustomOp):
                 input_tensor_cpu[graph_index][:batch_size].copy_(hidden_states, non_blocking=non_blocking)
                 expert_ids_cpu[graph_index][:batch_size].copy_(topk_ids, non_blocking=non_blocking)
                 weights_cpu[graph_index][:batch_size].copy_(topk_weights, non_blocking=non_blocking) 
+                _record_d2h_bytes(
+                    hidden_states,
+                    topk_ids,
+                    topk_weights,
+                )
                 input_ptr = input_tensor_cpu[graph_index].data_ptr()
                 expert_ids_ptr = expert_ids_cpu[graph_index].data_ptr()
                 weights_ptr = weights_cpu[graph_index].data_ptr()
                 output_ptr = output_cpu[graph_index].data_ptr()   
+                kernel_start = time.perf_counter()
                 self.lk_moe.submit_with_cuda_stream(
                     stream_ptr, 
                     batch_size,                                   # qlen
@@ -2818,9 +2857,13 @@ class FusedMoE(CustomOp):
                     output_ptr,                      # output 
                     bsz_tensor_cpu[graph_index].data_ptr()                   # bsz_tensor
                 )  
-                self.lk_moe.sync_with_cuda_stream(stream_ptr)  
+                self.lk_moe.sync_with_cuda_stream(stream_ptr)
+                _lk_moe_cpu_kernel_time_seconds.observe(
+                    time.perf_counter() - kernel_start
+                )
                 
                 output_gpu[graph_index][:batch_size].copy_(output_cpu[graph_index][:batch_size], non_blocking=non_blocking) 
+                _record_h2d_bytes(output_cpu[graph_index][:batch_size])
                 if self.check_nan_in_output: 
                     torch.nan_to_num(output_gpu[graph_index][:batch_size], nan=0.0, out=output_gpu[graph_index][:batch_size])
                 return output_gpu[graph_index][:batch_size]
@@ -2883,7 +2926,13 @@ class FusedMoE(CustomOp):
                         staged_weights_cpu[:batch_size].copy_(
                             topk_weights, non_blocking=non_blocking
                         )
+                        _record_d2h_bytes(
+                            hidden_states,
+                            topk_ids,
+                            topk_weights,
+                        )
 
+                        kernel_start = time.perf_counter()
                         self.lk_moe.submit_with_cuda_stream(
                             prefill_stream_ptr,
                             batch_size,  # qlen
@@ -2895,11 +2944,15 @@ class FusedMoE(CustomOp):
                             staged_bsz_tensor.data_ptr(),
                         )
                         self.lk_moe.sync_with_cuda_stream(prefill_stream_ptr)
+                        _lk_moe_cpu_kernel_time_seconds.observe(
+                            time.perf_counter() - kernel_start
+                        )
 
                         output_gpu = torch.empty_like(hidden_states)
                         output_gpu.copy_(
                             staged_output_cpu[:batch_size], non_blocking=non_blocking
                         )
+                        _record_h2d_bytes(staged_output_cpu[:batch_size])
                         if self.check_nan_in_output:
                             torch.nan_to_num(output_gpu, nan=0.0, out=output_gpu)
 

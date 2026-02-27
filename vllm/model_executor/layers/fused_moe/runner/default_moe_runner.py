@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
 from contextlib import nullcontext
+import threading
+import time
 import weakref
 
+from prometheus_client import Counter, Gauge, Histogram
 import torch
 import torch.nn.functional as F
 
@@ -49,6 +52,49 @@ from vllm.envs import (
     is_lk_moe_quant_on_gpu,
     is_lk_moe_use_gpu_prefill,
 )
+
+_lk_moe_prefetch_cache_queries_total = Counter(
+    name="vllm:lk_moe_prefetch_cache_queries_total",
+    documentation="Total lk_moe prefetch cache lookup count.",
+)
+_lk_moe_prefetch_cache_hits_total = Counter(
+    name="vllm:lk_moe_prefetch_cache_hits_total",
+    documentation="Total lk_moe prefetch cache hit count.",
+)
+_lk_moe_prefetch_hit_ratio = Gauge(
+    name="vllm:lk_moe_prefetch_hit_ratio",
+    documentation="Current lk_moe prefetch cache hit ratio.",
+    multiprocess_mode="mostrecent",
+)
+_lk_moe_prefetch_overlap_ratio = Histogram(
+    name="vllm:lk_moe_prefetch_overlap_ratio",
+    documentation=(
+        "Ratio of prefetch transfer time overlapped with computation "
+        "(1 means fully overlapped)."
+    ),
+    buckets=[0.1, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0],
+)
+_lk_moe_prefetch_overlap_ratio_last = Gauge(
+    name="vllm:lk_moe_prefetch_overlap_ratio_last",
+    documentation="Last observed lk_moe prefetch overlap ratio.",
+    multiprocess_mode="mostrecent",
+)
+_prefetch_cache_metrics_lock = threading.Lock()
+_prefetch_cache_queries = 0
+_prefetch_cache_hits = 0
+
+
+def _record_prefetch_cache_lookup(hit: bool) -> None:
+    global _prefetch_cache_queries, _prefetch_cache_hits
+    _lk_moe_prefetch_cache_queries_total.inc()
+    if hit:
+        _lk_moe_prefetch_cache_hits_total.inc()
+    with _prefetch_cache_metrics_lock:
+        _prefetch_cache_queries += 1
+        if hit:
+            _prefetch_cache_hits += 1
+        ratio = _prefetch_cache_hits / _prefetch_cache_queries
+    _lk_moe_prefetch_hit_ratio.set(ratio)
 
 
 def get_layer_from_name(layer_name: str) -> torch.nn.Module:
@@ -910,6 +956,8 @@ def _pop_prefetch_event(
     event = forward_context._prefetch_events.pop(layer_id, None)
     if wait and event is not None:
         event.synchronize()
+    if hasattr(forward_context, "_prefetch_start_times"):
+        forward_context._prefetch_start_times.pop(layer_id, None)
 
 
 def _get_prefill_lru_cache_capacity(gpu_prefetch_window: int) -> int:
@@ -1064,6 +1112,7 @@ def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor,
 
     # Mark current layer as recently used if already cached.
     current_layer_cached = _touch_prefill_cache(layer, forward_context)
+    _record_prefetch_cache_lookup(current_layer_cached)
 
     # Current layer must be ready before forward; if it was not prefetched and is
     # not resident, stage it immediately.
@@ -1106,7 +1155,9 @@ def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor,
                 continue
 
             # Cache hit: no extra H2D transfer needed, just refresh LRU recency.
-            if _touch_prefill_cache(candidate_layer, forward_context):
+            candidate_cached = _touch_prefill_cache(candidate_layer, forward_context)
+            _record_prefetch_cache_lookup(candidate_cached)
+            if candidate_cached:
                 continue
 
             if len(prefetch_candidates) < available_slots:
@@ -1347,6 +1398,9 @@ def moe_prepare_gpu_prefill(layer, forward_context: ForwardContext, device: torc
                 event = torch.cuda.Event()
                 event.record(prefetch_stream)
                 prefetch_events[layer_id] = event
+                if not hasattr(forward_context, "_prefetch_start_times"):
+                    forward_context._prefetch_start_times = {}
+                forward_context._prefetch_start_times[layer_id] = time.perf_counter()
         
             
 def moe_clean_gpu_prefill(layer): 
@@ -1377,6 +1431,19 @@ def moe_wait_prefetch(layer, hidden_states: torch.Tensor, forward_context: Forwa
     layer_id = id(layer)
     prefetch_events = forward_context._prefetch_events
     if layer_id in prefetch_events:
+        wait_start = time.perf_counter()
         prefetch_events[layer_id].wait()
+        wait_time = time.perf_counter() - wait_start
+        prefetch_start_times = getattr(forward_context, "_prefetch_start_times", None)
+        if isinstance(prefetch_start_times, dict):
+            prefetch_start = prefetch_start_times.pop(layer_id, None)
+            if isinstance(prefetch_start, float):
+                total_prefetch_time = time.perf_counter() - prefetch_start
+                if total_prefetch_time > 0:
+                    overlap_ratio = max(
+                        0.0, min(1.0, 1.0 - (wait_time / total_prefetch_time))
+                    )
+                    _lk_moe_prefetch_overlap_ratio.observe(overlap_ratio)
+                    _lk_moe_prefetch_overlap_ratio_last.set(overlap_ratio)
         del prefetch_events[layer_id] 
     
