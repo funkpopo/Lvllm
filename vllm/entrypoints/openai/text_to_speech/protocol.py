@@ -28,6 +28,10 @@ class SpeechRequest(OpenAIBaseModel):
     ref_text: str | None = None
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = Field(default=None, ge=1)
+    emit_every_frames: int | None = Field(default=None, ge=1)
+    decode_window_frames: int | None = Field(default=None, ge=1)
+    overlap_samples: int | None = Field(default=None, ge=0)
+    max_frames: int | None = Field(default=None, ge=1)
     stream: bool = False
 
     @model_validator(mode="after")

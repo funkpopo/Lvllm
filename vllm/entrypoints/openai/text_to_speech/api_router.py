@@ -5,7 +5,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.text_to_speech.protocol import SpeechRequest
@@ -30,7 +30,16 @@ def text_to_speech(request: Request) -> OpenAIServingTextToSpeech | None:
 @router.post(
     "/v1/audio/speech",
     responses={
-        HTTPStatus.OK.value: {"content": {"audio/wav": {}, "audio/pcm": {}}},
+        HTTPStatus.OK.value: {
+            "content": {
+                "audio/wav": {},
+                "audio/flac": {},
+                "audio/pcm": {},
+                "audio/mpeg": {},
+                "audio/aac": {},
+                "audio/opus": {},
+            }
+        },
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.UNPROCESSABLE_ENTITY.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
@@ -45,6 +54,13 @@ async def create_speech(request: SpeechRequest, raw_request: Request):
         return base_server.create_error_response(
             message="The model does not support Speech API"
         )
+
+    if request.stream:
+        result = await handler.create_speech_stream(request, raw_request)
+        if isinstance(result, ErrorResponse):
+            return JSONResponse(content=result.model_dump(), status_code=result.error.code)
+        stream, media_type = result
+        return StreamingResponse(content=stream, media_type=media_type)
 
     result = await handler.create_speech(request, raw_request)
     if isinstance(result, ErrorResponse):
