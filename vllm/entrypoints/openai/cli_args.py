@@ -138,6 +138,8 @@ class BaseFrontendArgs:
     """If set to True, enable tracking server_load_metrics in the app state."""
     enable_force_include_usage: bool = False
     """If set to True, including usage on every request."""
+    tts_max_instructions_length: int = 500
+    """Maximum character length for TTS `instructions`."""
     enable_tokenizer_info_endpoint: bool = False
     """Enable the `/tokenizer_info` endpoint. May expose chat
     templates and other tokenizer configuration."""

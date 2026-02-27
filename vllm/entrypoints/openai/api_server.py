@@ -219,6 +219,12 @@ def build_app(
 
         elastic_ep_attach_router(app)
 
+    from vllm.entrypoints.openai.text_to_speech.api_router import (
+        attach_router as register_text_to_speech_api_router,
+    )
+
+    register_text_to_speech_api_router(app)
+
     if "transcription" in supported_tasks:
         from vllm.entrypoints.openai.speech_to_text.api_router import (
             attach_router as register_speech_to_text_api_router,
@@ -355,6 +361,10 @@ async def init_app_state(
         await init_generate_state(
             engine_client, state, args, request_logger, supported_tasks
         )
+
+    from vllm.entrypoints.openai.text_to_speech.api_router import init_speech_state
+
+    init_speech_state(engine_client, state, args, request_logger)
 
     if "transcription" in supported_tasks:
         from vllm.entrypoints.openai.speech_to_text.api_router import (

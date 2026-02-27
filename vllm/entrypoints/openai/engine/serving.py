@@ -62,6 +62,7 @@ from vllm.entrypoints.openai.speech_to_text.protocol import (
     TranscriptionResponse,
     TranslationRequest,
 )
+from vllm.entrypoints.openai.text_to_speech.protocol import SpeechRequest
 from vllm.entrypoints.pooling.classify.protocol import (
     ClassificationChatRequest,
     ClassificationCompletionRequest,
@@ -176,11 +177,13 @@ ChatLikeRequest: TypeAlias = (
 )
 
 SpeechToTextRequest: TypeAlias = TranscriptionRequest | TranslationRequest
+SpeechRequestTTS: TypeAlias = SpeechRequest
 
 AnyRequest: TypeAlias = (
     CompletionLikeRequest
     | ChatLikeRequest
     | SpeechToTextRequest
+    | SpeechRequestTTS
     | ResponsesRequest
     | IOProcessorRequest
     | GenerateRequest

@@ -103,6 +103,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     step3_text="Step3TextConfig",
     step3p5="Step3p5Config",
     qwen3_asr="Qwen3ASRConfig",
+    qwen3_tts="Qwen3TTSConfig",
     qwen3_next="Qwen3NextConfig",
     qwen3_5="Qwen3_5Config",
     qwen3_5_moe="Qwen3_5MoeConfig",

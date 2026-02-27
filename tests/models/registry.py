@@ -485,6 +485,11 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         trust_remote_code=True,
     ),
     "SmolLM3ForCausalLM": _HfExamplesInfo("HuggingFaceTB/SmolLM3-3B"),
+    "Qwen3TTSForConditionalGeneration": _HfExamplesInfo(
+        "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        min_transformers_version="4.57",
+        trust_remote_code=True,
+    ),
     "StableLMEpochForCausalLM": _HfExamplesInfo("stabilityai/stablelm-zephyr-3b"),
     "StableLmForCausalLM": _HfExamplesInfo("stabilityai/stablelm-3b-4e1t"),
     "Starcoder2ForCausalLM": _HfExamplesInfo("bigcode/starcoder2-3b"),
