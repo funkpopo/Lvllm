@@ -23,6 +23,7 @@ Lvllm使用最新的vLLM源码，重新设计实现了MOE模型混合推理模�
 - [如何运行Qwen3.5-397B-A17B](#如何运行qwen35-397b-a17b)
 - [如何运行MiniMax-M2.5](#如何运行minimax-m25)
 - [如何运行Kimi-K2.5](#如何运行kimi-k25)
+- [如何运行GLM-4.7-FP8](#如何运行glm-47-fp8)
 - [配置参数](#配置参数)
 - [安装步骤](#安装步骤) 
 - [更新](#更新)
@@ -246,7 +247,7 @@ vllm serve \
 ```
 
 ```bash 
---enable_expert_parallel # 启用EP并行, 8卡运行minimax-m2.1模型需设置
+--enable_expert_parallel # 启用EP并行, 8卡运行minimax-m2.1、minimax-m2.5模型需设置
 ```
 
 ## 如何运行Kimi-K2.5
@@ -292,6 +293,56 @@ vllm serve \
     --enable-auto-tool-choice \
     --tool-call-parser kimi_k2 \
     --reasoning-parser kimi_k2 
+
+```
+
+
+## 如何运行GLM-4.7-FP8
+
+```bash
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+free -h
+
+pip uninstall transformers -y
+pip install transformers==4.57.6
+
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+VLLM_TEST_FORCE_FP8_MARLIN=1 \
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 \
+OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_GPU_RESIDENT_MOE_LAYERS=0 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_MOE_QUANT_ON_GPU=1 \
+vllm serve \
+    --model /home/guqiong/Models/GLM-4.7-FP8 \
+    --host 0.0.0.0 \
+    --port 8070 \
+    --tensor-parallel-size 2 \
+    --max-model-len 40000 \
+    --gpu-memory-utilization 0.80 \
+    --trust-remote-code \
+    --tokenizer-mode auto \
+    --swap-space 0 \
+    --served-model-name GLM-4.7-FP8 \
+    --compilation_config.cudagraph_mode FULL_DECODE_ONLY \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --max-num-batched-tokens 32768 \
+    --dtype bfloat16 \
+    --max-num-seqs 4 \
+    --compilation_config.mode VLLM_COMPILE \
+    --enable-auto-tool-choice \
+    --tool-call-parser glm47 \
+    --reasoning-parser glm45 
 
 ```
 

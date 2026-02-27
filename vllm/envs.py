@@ -224,7 +224,6 @@ if TYPE_CHECKING:
     LVLLM__MOE_WEIGHTS: bool = False
     LVLLM_GPU_PREFILL_MIN_BATCH_SIZE: int = 0
     LVLLM_GPU_PREFETCH_WINDOW: int = 1
-    LVLLM_GPU_PREFILL_LRU_CACHE_SIZE: int = 0
     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
@@ -1575,11 +1574,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "LVLLM_GPU_PREFETCH_WINDOW": lambda: int(
         os.getenv("LVLLM_GPU_PREFETCH_WINDOW", "3")
     ),
-    # LRU cache size for prefetched MOE weights in GPU prefill path.
-    # 0 means auto-select (currently max(4, LVLLM_GPU_PREFETCH_WINDOW)).
-    "LVLLM_GPU_PREFILL_LRU_CACHE_SIZE": lambda: int(
-        os.getenv("LVLLM_GPU_PREFILL_LRU_CACHE_SIZE", "0")
-    ),
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
@@ -1775,7 +1769,6 @@ def compile_factors() -> dict[str, object]:
         "LVLLM_MOE_USE_WEIGHT",
         "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE",
         "LVLLM_GPU_PREFETCH_WINDOW",
-        "LVLLM_GPU_PREFILL_LRU_CACHE_SIZE",
         "LVLLM_ENABLE_NUMA_INTERLEAVE",
         "LVLLM_MOE_QUANT_ON_GPU",
     }
@@ -1881,10 +1874,6 @@ def get_moe_compute_strategy() -> MoeComputeStrategy:
 def get_gpu_prefetch_window() -> int:
     return environment_variables["LVLLM_GPU_PREFETCH_WINDOW"]()
 
-
-def get_gpu_prefill_lru_cache_size() -> int:
-    return environment_variables["LVLLM_GPU_PREFILL_LRU_CACHE_SIZE"]()
-
 def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
     """
     Extract the layer index from the module name.
@@ -1924,53 +1913,39 @@ def is_lk_moe_gpu_prefill_layer(layer_name: str) -> bool:
 def is_lk_moe_cpu_layer(layer_name: str)-> bool:
 
     return is_lk_moe_feature_enabled() and not is_lk_moe_gpu_resident_layer(layer_name) and not is_lk_moe_gpu_prefill_layer(layer_name)
-
-
-# Cache parsed residency plans by env string to avoid reparsing on hot paths.
-@functools.lru_cache(maxsize=8)
-def _parse_lk_moe_gpu_resident_layer_plan(
-    gpu_resident_layers_env: str,
-) -> frozenset[int]:
-    if not gpu_resident_layers_env:
-        return frozenset()
-
-    resident_layers: set[int] = set()
-    for part in gpu_resident_layers_env.split(","):
+    
+def is_lk_moe_gpu_resident_layer(layer_name: str) -> bool:
+    
+    if not is_lk_moe_feature_enabled():
+        return True
+    
+    layer_id = extract_layer_index(layer_name)
+    
+  
+    disabled_layers_env = environment_variables.get("LVLLM_GPU_RESIDENT_MOE_LAYERS", "")()
+    if not disabled_layers_env:
+        return False   
+    
+    disabled_layers_env = disabled_layers_env.strip()
+    
+    disabled_layers = set()
+    for part in disabled_layers_env.split(','):
         part = part.strip()
         if not part:
             continue
-
-        if "-" in part:
+        
+        if '-' in part:
             try:
-                start, end = map(int, part.split("-"))
-            except ValueError:
+                start, end = map(int, part.split('-')) 
+                if start <= end:
+                    disabled_layers.update(range(start, end + 1))
+            except ValueError: 
                 continue
-            if start <= end:
-                resident_layers.update(range(start, end + 1))
         else:
             try:
-                resident_layers.add(int(part))
-            except ValueError:
+                disabled_layers.add(int(part))
+            except ValueError: 
                 continue
-
-    return frozenset(resident_layers)
-
-
-def get_lk_moe_gpu_resident_layer_plan() -> frozenset[int]:
-    gpu_resident_layers_env = environment_variables["LVLLM_GPU_RESIDENT_MOE_LAYERS"]()
-    if not gpu_resident_layers_env:
-        return frozenset()
-
-    return _parse_lk_moe_gpu_resident_layer_plan(gpu_resident_layers_env.strip())
-
-
-def is_lk_moe_gpu_resident_layer_idx(layer_idx: int) -> bool:
-    if not is_lk_moe_feature_enabled():
-        return True
-
-    return layer_idx in get_lk_moe_gpu_resident_layer_plan()
-    
-def is_lk_moe_gpu_resident_layer(layer_name: str) -> bool:
-    layer_idx = extract_layer_index(layer_name)
-    return is_lk_moe_gpu_resident_layer_idx(layer_idx)
+     
+    return layer_id in disabled_layers
  
