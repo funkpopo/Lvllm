@@ -407,7 +407,7 @@ git fetch && git reset --hard origin/main && git clean -fd # This command is sui
 
 # Install PyTorch 2.9.1
 pip uninstall torchaudio triton torchvision torch vllm
-pip install torch==2.9.1
+pip install torchaudio triton torchvision torch==2.9.1
 
 # Qwen3-VL GLM4.6V requires xformers to be installed
 
