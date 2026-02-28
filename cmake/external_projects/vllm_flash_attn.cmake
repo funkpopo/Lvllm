@@ -24,6 +24,7 @@ endif()
 # This is to enable local development of vllm-flash-attn within vLLM.
 # It can be set as an environment variable or passed as a cmake argument.
 # The environment variable takes precedence.
+set(VLLM_FLASH_ATTN_REQUIRED_COMMIT "5824e6e2008271063c3229ab3e7032bd74abbbc6")
 if (DEFINED ENV{VLLM_FLASH_ATTN_SRC_DIR})
   set(VLLM_FLASH_ATTN_SRC_DIR $ENV{VLLM_FLASH_ATTN_SRC_DIR})
 endif()
@@ -35,11 +36,31 @@ if(VLLM_FLASH_ATTN_SRC_DIR)
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
 else()
+  set(VLLM_FLASH_ATTN_SRC_DIR "${CMAKE_SOURCE_DIR}/third_party/flash-attention")
+  if(NOT EXISTS "${VLLM_FLASH_ATTN_SRC_DIR}/vllm_flash_attn")
+    message(FATAL_ERROR
+      "[vllm-flash-attn] source not found at ${VLLM_FLASH_ATTN_SRC_DIR}. "
+      "Please initialize submodules (git submodule update --init --recursive) "
+      "or set VLLM_FLASH_ATTN_SRC_DIR.")
+  endif()
+  find_package(Git QUIET)
+  if(GIT_FOUND AND EXISTS "${VLLM_FLASH_ATTN_SRC_DIR}/.git")
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" -C "${VLLM_FLASH_ATTN_SRC_DIR}" rev-parse HEAD
+      RESULT_VARIABLE FLASH_ATTN_HEAD_RESULT
+      OUTPUT_VARIABLE FLASH_ATTN_HEAD
+      ERROR_QUIET
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(NOT FLASH_ATTN_HEAD_RESULT EQUAL 0 OR NOT FLASH_ATTN_HEAD STREQUAL "${VLLM_FLASH_ATTN_REQUIRED_COMMIT}")
+      message(FATAL_ERROR
+        "[vllm-flash-attn] source must be pinned to ${VLLM_FLASH_ATTN_REQUIRED_COMMIT}, "
+        "but current HEAD is '${FLASH_ATTN_HEAD}'.")
+    endif()
+  endif()
   FetchContent_Declare(
           vllm-flash-attn
-          GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
-          GIT_TAG 5824e6e2008271063c3229ab3e7032bd74abbbc6
-          GIT_PROGRESS TRUE
+          SOURCE_DIR ${VLLM_FLASH_ATTN_SRC_DIR}
           # Don't share the vllm-flash-attn build between build types
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )

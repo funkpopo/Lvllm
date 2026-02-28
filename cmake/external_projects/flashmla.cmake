@@ -1,4 +1,5 @@
 include(FetchContent)
+set(FLASH_MLA_REQUIRED_COMMIT "692917b1cda61b93ac9ee2d846ec54e75afe87b1")
 
 # If FLASH_MLA_SRC_DIR is set, flash-mla is installed from that directory 
 # instead of downloading.
@@ -16,11 +17,31 @@ if(FLASH_MLA_SRC_DIR)
         BUILD_COMMAND ""
   )
 else()
+  set(FLASH_MLA_SRC_DIR "${CMAKE_SOURCE_DIR}/third_party/FlashMLA")
+  if(NOT EXISTS "${FLASH_MLA_SRC_DIR}/flash_mla/flash_mla_interface.py")
+    message(FATAL_ERROR
+      "[FlashMLA] source not found at ${FLASH_MLA_SRC_DIR}. "
+      "Please initialize submodules (git submodule update --init --recursive) "
+      "or set FLASH_MLA_SRC_DIR.")
+  endif()
+  find_package(Git QUIET)
+  if(GIT_FOUND AND EXISTS "${FLASH_MLA_SRC_DIR}/.git")
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" -C "${FLASH_MLA_SRC_DIR}" rev-parse HEAD
+      RESULT_VARIABLE FLASH_MLA_HEAD_RESULT
+      OUTPUT_VARIABLE FLASH_MLA_HEAD
+      ERROR_QUIET
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(NOT FLASH_MLA_HEAD_RESULT EQUAL 0 OR NOT FLASH_MLA_HEAD STREQUAL "${FLASH_MLA_REQUIRED_COMMIT}")
+      message(FATAL_ERROR
+        "[FlashMLA] source must be pinned to ${FLASH_MLA_REQUIRED_COMMIT}, "
+        "but current HEAD is '${FLASH_MLA_HEAD}'.")
+    endif()
+  endif()
   FetchContent_Declare(
         flashmla
-        GIT_REPOSITORY https://github.com/vllm-project/FlashMLA
-        GIT_TAG 692917b1cda61b93ac9ee2d846ec54e75afe87b1
-        GIT_PROGRESS TRUE
+        SOURCE_DIR ${FLASH_MLA_SRC_DIR}
         CONFIGURE_COMMAND ""
         BUILD_COMMAND ""
   )

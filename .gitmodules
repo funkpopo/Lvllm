@@ -1,0 +1,21 @@
+# Expected pinned refs (validated by CMake):
+# - third_party/cutlass: tag v4.2.1
+# - third_party/triton: tag v3.6.0
+# - third_party/qutlass: 830d2c4537c7396e14a02a46fbddd18b5d107c65
+# - third_party/flash-attention: 5824e6e2008271063c3229ab3e7032bd74abbbc6
+# - third_party/FlashMLA: 692917b1cda61b93ac9ee2d846ec54e75afe87b1
+[submodule "third_party/cutlass"]
+	path = third_party/cutlass
+	url = https://github.com/nvidia/cutlass.git
+[submodule "third_party/triton"]
+	path = third_party/triton
+	url = https://github.com/triton-lang/triton.git
+[submodule "third_party/qutlass"]
+	path = third_party/qutlass
+	url = https://github.com/IST-DASLab/qutlass.git
+[submodule "third_party/flash-attention"]
+	path = third_party/flash-attention
+	url = https://github.com/vllm-project/flash-attention.git
+[submodule "third_party/FlashMLA"]
+	path = third_party/FlashMLA
+	url = https://github.com/vllm-project/FlashMLA

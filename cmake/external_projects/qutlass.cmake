@@ -1,6 +1,7 @@
 include(FetchContent)
 
 set(CUTLASS_INCLUDE_DIR "${CUTLASS_INCLUDE_DIR}" CACHE PATH "Path to CUTLASS include/ directory")
+set(QUTLASS_REQUIRED_COMMIT "830d2c4537c7396e14a02a46fbddd18b5d107c65")
 
 if(DEFINED ENV{QUTLASS_SRC_DIR})
   set(QUTLASS_SRC_DIR $ENV{QUTLASS_SRC_DIR})
@@ -14,11 +15,31 @@ if(QUTLASS_SRC_DIR)
     BUILD_COMMAND ""
   )
 else()
+  set(QUTLASS_SRC_DIR "${CMAKE_SOURCE_DIR}/third_party/qutlass")
+  if(NOT EXISTS "${QUTLASS_SRC_DIR}/qutlass/csrc")
+    message(FATAL_ERROR
+      "[QUTLASS] source not found at ${QUTLASS_SRC_DIR}. "
+      "Please initialize submodules (git submodule update --init --recursive) "
+      "or set QUTLASS_SRC_DIR.")
+  endif()
+  find_package(Git QUIET)
+  if(GIT_FOUND AND EXISTS "${QUTLASS_SRC_DIR}/.git")
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" -C "${QUTLASS_SRC_DIR}" rev-parse HEAD
+      RESULT_VARIABLE QUTLASS_HEAD_RESULT
+      OUTPUT_VARIABLE QUTLASS_HEAD
+      ERROR_QUIET
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(NOT QUTLASS_HEAD_RESULT EQUAL 0 OR NOT QUTLASS_HEAD STREQUAL "${QUTLASS_REQUIRED_COMMIT}")
+      message(FATAL_ERROR
+        "[QUTLASS] source must be pinned to ${QUTLASS_REQUIRED_COMMIT}, "
+        "but current HEAD is '${QUTLASS_HEAD}'.")
+    endif()
+  endif()
   FetchContent_Declare(
     qutlass
-    GIT_REPOSITORY https://github.com/IST-DASLab/qutlass.git
-    GIT_TAG 830d2c4537c7396e14a02a46fbddd18b5d107c65
-    GIT_PROGRESS TRUE
+    SOURCE_DIR ${QUTLASS_SRC_DIR}
     CONFIGURE_COMMAND ""
     BUILD_COMMAND ""
   )

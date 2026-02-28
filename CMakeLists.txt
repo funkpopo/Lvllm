@@ -307,35 +307,43 @@ set(VLLM_EXT_SRC
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
+  set(VLLM_CUTLASS_REQUIRED_TAG "v4.2.1")
 
-  # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages when building.
-  set(CUTLASS_REVISION "v4.2.1")
-
-  # Use the specified CUTLASS source directory for compilation if VLLM_CUTLASS_SRC_DIR is provided
+  # Use a local CUTLASS checkout (env override first, then git submodule path).
   if (DEFINED ENV{VLLM_CUTLASS_SRC_DIR})
     set(VLLM_CUTLASS_SRC_DIR $ENV{VLLM_CUTLASS_SRC_DIR})
   endif()
-
   if(VLLM_CUTLASS_SRC_DIR)
     if(NOT IS_ABSOLUTE VLLM_CUTLASS_SRC_DIR)
       get_filename_component(VLLM_CUTLASS_SRC_DIR "${VLLM_CUTLASS_SRC_DIR}" ABSOLUTE)
     endif()
-    message(STATUS "The VLLM_CUTLASS_SRC_DIR is set, using ${VLLM_CUTLASS_SRC_DIR} for compilation")
-    FetchContent_Declare(cutlass SOURCE_DIR ${VLLM_CUTLASS_SRC_DIR})
   else()
-    FetchContent_Declare(
-        cutlass
-        GIT_REPOSITORY https://github.com/nvidia/cutlass.git
-        # Please keep this in sync with CUTLASS_REVISION line above.
-        GIT_TAG ${CUTLASS_REVISION}
-        GIT_PROGRESS TRUE
-
-        # Speed up CUTLASS download by retrieving only the specified GIT_TAG instead of the history.
-        # Important: If GIT_SHALLOW is enabled then GIT_TAG works only with branch names and tags.
-        # So if the GIT_TAG above is updated to a commit hash, GIT_SHALLOW must be set to FALSE
-        GIT_SHALLOW TRUE
-    )
+    set(VLLM_CUTLASS_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass")
   endif()
+
+  if(NOT EXISTS "${VLLM_CUTLASS_SRC_DIR}/include/cutlass/cutlass.h")
+    message(FATAL_ERROR
+      "CUTLASS source not found at '${VLLM_CUTLASS_SRC_DIR}'. "
+      "Please initialize submodules (git submodule update --init --recursive) "
+      "or set VLLM_CUTLASS_SRC_DIR.")
+  endif()
+  find_package(Git QUIET)
+  if(GIT_FOUND AND EXISTS "${VLLM_CUTLASS_SRC_DIR}/.git")
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" -C "${VLLM_CUTLASS_SRC_DIR}" describe --tags --exact-match
+      RESULT_VARIABLE CUTLASS_TAG_RESULT
+      OUTPUT_VARIABLE CUTLASS_TAG
+      ERROR_QUIET
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(NOT CUTLASS_TAG_RESULT EQUAL 0 OR NOT CUTLASS_TAG STREQUAL "${VLLM_CUTLASS_REQUIRED_TAG}")
+      message(FATAL_ERROR
+        "CUTLASS must be pinned to tag ${VLLM_CUTLASS_REQUIRED_TAG}, "
+        "but current checkout is '${CUTLASS_TAG}'.")
+    endif()
+  endif()
+  message(STATUS "Using CUTLASS source at ${VLLM_CUTLASS_SRC_DIR}")
+  FetchContent_Declare(cutlass SOURCE_DIR ${VLLM_CUTLASS_SRC_DIR})
   FetchContent_MakeAvailable(cutlass)
 
   list(APPEND VLLM_EXT_SRC
