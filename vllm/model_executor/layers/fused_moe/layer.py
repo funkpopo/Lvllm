@@ -1856,6 +1856,48 @@ class FusedMoE(CustomOp):
         if self.use_ep:
             return self.ep_size, self.ep_rank  
         return self.tp_size, self.tp_rank    
+
+    def _create_lk_moe_quant_config(
+        self,
+        num_processes: int,
+        process_id: int,
+        hidden_ggml_type: int,
+        w13_weight_ptr: int,
+        w2_weight_ptr: int,
+        group_size: int,
+        num_bits: int,
+    ):
+        quant_config_ctor = getattr(lk_moe, "MOE_QuantConfig", None)
+        if quant_config_ctor is None:
+            lk_moe_version = getattr(lk_moe, "__version__", "unknown")
+            lk_moe_file = getattr(lk_moe, "__file__", "unknown")
+            raise AttributeError(
+                "lk_moe must export MOE_QuantConfig. "
+                f"Detected lk_moe version={lk_moe_version}, module={lk_moe_file}. "
+                "Please upgrade lk_moe to a compatible version."
+            )
+
+        shared_args = (
+            num_processes,
+            process_id,
+            self.local_num_experts,
+            self.top_k,
+            self.hidden_size,
+            self.intermediate_size_per_partition,
+            32,
+            10,
+            1024,
+            hidden_ggml_type,
+        )
+        return quant_config_ctor(
+            *shared_args,
+            0,
+            0,
+            w13_weight_ptr,
+            w2_weight_ptr,
+            group_size,
+            num_bits,
+        )
                    
     def _process_gguf_weights(self):  
  
@@ -2183,23 +2225,14 @@ class FusedMoE(CustomOp):
          
         num_processes, process_id = self._get_processes_info()
          
-        self.lk_moe_config = lk_moe.MOE_QuantConfig(
-            num_processes,                     # num_processes
-            process_id,                        # process_id
-            self.local_num_experts,            # expert_num
-            self.top_k,                        # routed_expert_num
-            self.hidden_size,                  # hidden_size
-            self.intermediate_size_per_partition,  # intermediate_size
-            32,                                # stride
-            10,                                # group_min_len
-            1024,   # group_max_len
-            hidden_ggml_type,                  # hidden_type 
-            0,                                 # w13_weight_data_type: 0 for fp32
-            0,                                # w2_weight_data_type: 0 for fp32
-            w13_weight_ptr,                    # w13_weight_ptr 
-            w2_weight_ptr,                     # w2_weight_ptr   
-            group_size,                        # group_size 
-            num_bits,                          # num_bits 
+        self.lk_moe_config = self._create_lk_moe_quant_config(
+            num_processes=num_processes,
+            process_id=process_id,
+            hidden_ggml_type=hidden_ggml_type,
+            w13_weight_ptr=w13_weight_ptr,
+            w2_weight_ptr=w2_weight_ptr,
+            group_size=group_size,
+            num_bits=num_bits,
         )
          
         self.lk_moe = lk_moe.MOE_Quant(self.lk_moe_config)
@@ -2374,23 +2407,14 @@ class FusedMoE(CustomOp):
          
         num_processes, process_id = self._get_processes_info()
          
-        self.lk_moe_config = lk_moe.MOE_QuantConfig(
-            num_processes,                     # num_processes
-            process_id,                        # process_id
-            self.local_num_experts,            # expert_num
-            self.top_k,                        # routed_expert_num
-            self.hidden_size,                  # hidden_size
-            self.intermediate_size_per_partition,  # intermediate_size
-            32,                                # stride
-            10,                                # group_min_len
-            1024,   # group_max_len
-            hidden_ggml_type,                  # hidden_type 
-            0,                                 # w13_weight_data_type: 0 for fp32
-            0,                                # w2_weight_data_type: 0 for fp32
-            w13_weight_ptr,                    # w13_weight_ptr 
-            w2_weight_ptr,                     # w2_weight_ptr   
-            group_size,                        # group_size 
-            num_bits,                          # num_bits 
+        self.lk_moe_config = self._create_lk_moe_quant_config(
+            num_processes=num_processes,
+            process_id=process_id,
+            hidden_ggml_type=hidden_ggml_type,
+            w13_weight_ptr=w13_weight_ptr,
+            w2_weight_ptr=w2_weight_ptr,
+            group_size=group_size,
+            num_bits=num_bits,
         )
          
         self.lk_moe = lk_moe.MOE_Quant(self.lk_moe_config)
