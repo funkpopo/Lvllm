@@ -23,6 +23,7 @@ Lvllm uses the latest vLLM source code and has redesigned and implemented MOE mo
 - [How to Run Qwen3.5-397B-A17B](#how-to-run-qwen35-397b-a17b)
 - [How to Run MiniMax-M2.5](#how-to-run-minimax-m25)
 - [How to Run Kimi-K2.5](#how-to-run-kimi-k25)
+- [How to Run GLM-4.7-FP8](#how-to-run-glm-47-fp8)
 - [Configuration Parameters](#configuration-parameters)
 - [Installation Steps](#installation-steps)
 - [Update](#update)
@@ -246,7 +247,7 @@ vllm serve \
 ```
 
 ```bash 
---enable_expert_parallel # enable expert parallelism, 8-card inference of minimax-m2.1 model requires setting
+--enable_expert_parallel # enable expert parallelism, 8-card inference of minimax-m2.1、minimax-m2.5 model requires setting
 ```
 
 ## How to Run Kimi-K2.5
@@ -294,6 +295,57 @@ vllm serve \
     --reasoning-parser kimi_k2 
 
 ```
+
+
+## How to Run GLM-4.7-FP8
+
+```bash
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+free -h
+
+pip uninstall transformers -y
+pip install transformers==4.57.6
+
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+VLLM_TEST_FORCE_FP8_MARLIN=1 \
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 \
+OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_GPU_RESIDENT_MOE_LAYERS=0 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_MOE_QUANT_ON_GPU=1 \
+vllm serve \
+    --model /home/guqiong/Models/GLM-4.7-FP8 \
+    --host 0.0.0.0 \
+    --port 8070 \
+    --tensor-parallel-size 2 \
+    --max-model-len 40000 \
+    --gpu-memory-utilization 0.80 \
+    --trust-remote-code \
+    --tokenizer-mode auto \
+    --swap-space 0 \
+    --served-model-name GLM-4.7-FP8 \
+    --compilation_config.cudagraph_mode FULL_DECODE_ONLY \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --max-num-batched-tokens 32768 \
+    --dtype bfloat16 \
+    --max-num-seqs 4 \
+    --compilation_config.mode VLLM_COMPILE \
+    --enable-auto-tool-choice \
+    --tool-call-parser glm47 \
+    --reasoning-parser glm45 
+
+```
+
 ## Configuration Parameters
 
 | Environment Variable | Type | Default Value | Description | Notes |
