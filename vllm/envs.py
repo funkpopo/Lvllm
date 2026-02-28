@@ -225,6 +225,8 @@ if TYPE_CHECKING:
     LVLLM_GPU_PREFILL_MIN_BATCH_SIZE: int = 0
     LVLLM_GPU_PREFETCH_WINDOW: int = 1
     LVLLM_GPU_PREFILL_LRU_CACHE_SIZE: int = 0
+    LVLLM_GPU_PREFILL_CONFIG_HARD_CHECK: bool = True
+    LVLLM_GPU_PREFILL_AUTO_CLAMP: bool = False
     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
@@ -1573,12 +1575,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Prefetch window size for GPU expert computation.
     "LVLLM_GPU_PREFETCH_WINDOW": lambda: int(
-        os.getenv("LVLLM_GPU_PREFETCH_WINDOW", "3")
+        os.getenv("LVLLM_GPU_PREFETCH_WINDOW", "1")
     ),
     # LRU cache size for prefetched MOE weights in GPU prefill path.
     # 0 means auto-select (currently max(4, LVLLM_GPU_PREFETCH_WINDOW)).
     "LVLLM_GPU_PREFILL_LRU_CACHE_SIZE": lambda: int(
         os.getenv("LVLLM_GPU_PREFILL_LRU_CACHE_SIZE", "0")
+    ),
+    # Whether to fail fast on invalid GPU prefill config combinations.
+    "LVLLM_GPU_PREFILL_CONFIG_HARD_CHECK": lambda: bool(
+        int(os.getenv("LVLLM_GPU_PREFILL_CONFIG_HARD_CHECK", "1"))
+    ),
+    # Whether to clamp out-of-range GPU prefill configs instead of failing.
+    "LVLLM_GPU_PREFILL_AUTO_CLAMP": lambda: bool(
+        int(os.getenv("LVLLM_GPU_PREFILL_AUTO_CLAMP", "0"))
     ),
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
@@ -1776,6 +1786,8 @@ def compile_factors() -> dict[str, object]:
         "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE",
         "LVLLM_GPU_PREFETCH_WINDOW",
         "LVLLM_GPU_PREFILL_LRU_CACHE_SIZE",
+        "LVLLM_GPU_PREFILL_CONFIG_HARD_CHECK",
+        "LVLLM_GPU_PREFILL_AUTO_CLAMP",
         "LVLLM_ENABLE_NUMA_INTERLEAVE",
         "LVLLM_MOE_QUANT_ON_GPU",
     }
@@ -1869,6 +1881,37 @@ def set_profile_run(status: bool):
     
 def get_gpu_prefill_min_batch_size() -> int:
     return environment_variables["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"]() 
+
+
+def validate_lk_moe_gpu_prefill_config(max_num_batched_tokens: int) -> int:
+    gpu_prefill_min_batch_size = get_gpu_prefill_min_batch_size()
+    if gpu_prefill_min_batch_size <= max_num_batched_tokens:
+        return gpu_prefill_min_batch_size
+
+    message = (
+        "Invalid GPU prefill config: "
+        f"LVLLM_GPU_PREFILL_MIN_BATCH_SIZE ({gpu_prefill_min_batch_size}) "
+        f"must be <= max_num_batched_tokens ({max_num_batched_tokens})."
+    )
+    if environment_variables["LVLLM_GPU_PREFILL_AUTO_CLAMP"]():
+        logger.warning(
+            "%s Auto clamp enabled, clamping to %d.",
+            message,
+            max_num_batched_tokens,
+        )
+        enable_lk_moe_gpu_prefill(max_num_batched_tokens)
+        return max_num_batched_tokens
+
+    if environment_variables["LVLLM_GPU_PREFILL_CONFIG_HARD_CHECK"]():
+        raise ValueError(message)
+
+    logger.warning(
+        "%s Continuing because LVLLM_GPU_PREFILL_CONFIG_HARD_CHECK=0.",
+        message,
+    )
+    return gpu_prefill_min_batch_size
+
+
 def get_moe_compute_strategy() -> MoeComputeStrategy: 
     strategy = environment_variables["LVLLM_MOE_USE_WEIGHT"]()
     

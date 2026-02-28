@@ -306,8 +306,10 @@ vllm serve \
 | `OMP_NUM_THREADS` | 性能参数 | 系统逻辑核心数量 | OpenMP线程数: 设置为`LK_THREADS`相同 |   | 
 | `LVLLM_MOE_USE_WEIGHT` | 性能参数 | `TO_DTYPE` | 运行时专家权重格式`TO_DTYPE`: 与config.yaml中dtype一致,bfloat16/float16, `KEEP`: 与模型一致，`INT4`: int4  |
 | `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU预填充参数 | 无 | 常驻GPU的MOE专家层`0`: 第0层，`0-1`: 第0层到第1层，`0,9`: 第0层和第9层 | 留足KV Cache显存后，分配多层可增加性能，并减少对应的内存占用，包含0层才有加速效果 |
-| `LVLLM_GPU_PREFETCH_WINDOW` | GPU预填充参数 | 无 | 预取窗口大小`1`: 预取1层MOE专家 |  一般预取1到2层即可 |
-| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU预填充参数 | 无 | 使用GPU预填充的最小输入长度`4096`：输入长度达到该值后，启动GPU预填充 | 设置值不宜过小，设置为0则关闭GPU预填充功能 |
+| `LVLLM_GPU_PREFETCH_WINDOW` | GPU预填充参数 | `1` | 预取窗口大小`1`: 预取1层MOE专家 |  一般预取1到2层即可 |
+| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU预填充参数 | `0` | 使用GPU预填充的最小输入长度`4096`：输入长度达到该值后，启动GPU预填充 | 设置值不宜过小，设置为0则关闭GPU预填充功能 |
+| `LVLLM_GPU_PREFILL_CONFIG_HARD_CHECK` | GPU预填充参数 | `1` | 启动阶段是否对非法组合直接失败（例如 `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE > max_num_batched_tokens`） | 设置为`0`可降级为 warning 日志 |
+| `LVLLM_GPU_PREFILL_AUTO_CLAMP` | GPU预填充参数 | `0` | 启动阶段是否自动钳制越界配置 | 设置为`1`会把 `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` 自动降到 `max_num_batched_tokens` |
 | `LK_POWER_SAVING` | cpu节能 | 0 | `1`：启用cpu节能模式，`0`：禁用cpu节能模式 | 建议值：`0` |
 | `LVLLM_ENABLE_NUMA_INTERLEAVE` | 性能参数 | 0 | `0`：快速加载模型，`1`：慢速加载模型可避免OOM | 建议值：加载模型文件时，内存充裕使用`0`，内存紧张使用`1` |
 | `LVLLM_MOE_QUANT_ON_GPU` | 性能参数 | 0 | `0`：不启用GPU专家量化，`1`：启用GPU专家量化 | 显存充足可启用（仅加载时有效，推理时不会额外占用显存），加快模型加载速度 |

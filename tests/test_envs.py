@@ -119,6 +119,54 @@ def test_lk_moe_gpu_resident_layer_idx_disabled_feature(
     assert envs.is_lk_moe_gpu_resident_layer_idx(123)
 
 
+def test_gpu_prefetch_window_default_is_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LVLLM_GPU_PREFETCH_WINDOW", raising=False)
+    assert envs.environment_variables["LVLLM_GPU_PREFETCH_WINDOW"]() == 1
+
+
+def test_validate_lk_moe_gpu_prefill_config_hard_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        envs.environment_variables, "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE", lambda: 4096
+    )
+    monkeypatch.setitem(
+        envs.environment_variables, "LVLLM_GPU_PREFILL_CONFIG_HARD_CHECK", lambda: True
+    )
+    monkeypatch.setitem(
+        envs.environment_variables, "LVLLM_GPU_PREFILL_AUTO_CLAMP", lambda: False
+    )
+
+    with pytest.raises(ValueError, match="LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"):
+        envs.validate_lk_moe_gpu_prefill_config(max_num_batched_tokens=2048)
+
+
+def test_validate_lk_moe_gpu_prefill_config_auto_clamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        envs.environment_variables, "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE", lambda: 4096
+    )
+    monkeypatch.setitem(
+        envs.environment_variables, "LVLLM_GPU_PREFILL_CONFIG_HARD_CHECK", lambda: True
+    )
+    monkeypatch.setitem(
+        envs.environment_variables, "LVLLM_GPU_PREFILL_AUTO_CLAMP", lambda: True
+    )
+
+    clamped_values: list[int] = []
+    monkeypatch.setattr(
+        envs,
+        "enable_lk_moe_gpu_prefill",
+        lambda value: clamped_values.append(value) or value,
+    )
+
+    assert envs.validate_lk_moe_gpu_prefill_config(max_num_batched_tokens=2048) == 2048
+    assert clamped_values == [2048]
+
+
 class TestEnvWithChoices:
     """Test cases for env_with_choices function."""
 

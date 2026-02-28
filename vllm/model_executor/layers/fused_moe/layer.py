@@ -60,7 +60,19 @@ logger = init_logger(__name__)
 import threading
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.envs import MoeComputeStrategy
-from vllm.envs import is_lk_moe_feature_enabled, get_moe_compute_strategy, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, is_lk_moe_quant_on_gpu, is_in_profile_run
+from vllm.envs import (
+    get_gpu_prefetch_window,
+    get_gpu_prefill_min_batch_size,
+    get_moe_compute_strategy,
+    is_in_profile_run,
+    is_lk_moe_cpu_layer,
+    is_lk_moe_feature_enabled,
+    is_lk_moe_gpu_prefill_layer,
+    is_lk_moe_gpu_resident_layer,
+    is_lk_moe_quant_on_gpu,
+    is_lk_moe_use_gpu_prefill,
+    validate_lk_moe_gpu_prefill_config,
+)
 
 _lk_moe_cpu_kernel_time_seconds = Histogram(
     name="vllm:lk_moe_cpu_kernel_time_seconds",
@@ -458,13 +470,10 @@ class FusedMoE(CustomOp):
         self.is_gpu_resident_layer = is_lk_moe_gpu_resident_layer(self.layer_name) 
         self.is_gpu_prefill_layer = is_lk_moe_gpu_prefill_layer(self.layer_name)
         self.is_cpu_layer = is_lk_moe_cpu_layer(self.layer_name)
-        if get_gpu_prefill_min_batch_size() > vllm_config.scheduler_config.max_num_batched_tokens:
-            logger.error(
-                f"gpu_prefill_min_batch_size ({get_gpu_prefill_min_batch_size()}) "
-                f"must be less than or equal to max_num_batched_tokens "
-                f"({vllm_config.scheduler_config.max_num_batched_tokens})"
-            )
-             
+        validate_lk_moe_gpu_prefill_config(
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+
 
         self.enable_eplb = enable_eplb
         # TODO(bnell): should this be owned by router?
