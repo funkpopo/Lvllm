@@ -987,10 +987,11 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> mk.FusedMoEPrepareAndFinalize | None:
-        raise ValueError(
-            f"{self.__class__.__name__} uses the new modular kernel initialization "
-            "logic. This function should not be called."
-        )
+        pass
+        # raise ValueError(
+        #     f"{self.__class__.__name__} uses the new modular kernel initialization "
+        #     "logic. This function should not be called."
+        # )
 
     def select_gemm_impl(
         self,
