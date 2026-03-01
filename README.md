@@ -429,7 +429,7 @@ git clone https://github.com/guqiong96/Lvllm.git
 cd Lvllm
 
 # Install PyTorch 2.9.1
-pip install torch==2.9.1
+pip install torchaudio triton torchvision torch==2.9.1
 
 # Use existing PyTorch
 python use_existing_torch.py
