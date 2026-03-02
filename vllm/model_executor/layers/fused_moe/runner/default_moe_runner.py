@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
 from contextlib import nullcontext
 
 import torch
@@ -39,7 +40,12 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 logger = init_logger(__name__)
 from vllm.utils.platform_utils import is_pin_memory_available
 
-from vllm.envs import is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, is_lk_moe_quant_on_gpu
+from vllm.envs import (
+    get_gpu_prefetch_window,
+    get_gpu_prefill_min_batch_size,
+    is_lk_moe_gpu_resident_layer,
+    is_lk_moe_use_gpu_prefill,
+)
 def get_layer_from_name(layer_name: str) -> torch.nn.Module:
     forward_context: ForwardContext = get_forward_context()
     if layer_name == "from_forward_context":
@@ -1179,51 +1185,67 @@ def moe_clean_gpu_prefill_regular(layer):
     setattr(layer, "w2_weight", torch.nn.Parameter(torch.empty(0,  device=torch.cuda.current_device()), requires_grad=False))
      
 
+_GPU_PREFILL_PREPARE_HANDLERS: dict[
+    str, Callable[[torch.nn.Module, ForwardContext, torch.device], None]
+] = {
+    "UnquantizedFusedMoEMethod": moe_prepare_gpu_prefill_regular,
+    "CompressedTensorsWNA16MarlinMoEMethod": moe_prepare_gpu_prefill_wna16,
+    "CompressedTensorsWNA16MoEMethod": moe_prepare_gpu_prefill_wna16,
+    "Fp8MoEMethod": moe_prepare_gpu_prefill_fp8,
+    "CompressedTensorsW8A8Fp8MoEMethod": moe_prepare_gpu_prefill_fp8,
+}
+
+_GPU_PREFILL_CLEAN_HANDLERS: dict[str, Callable[[torch.nn.Module], None]] = {
+    "UnquantizedFusedMoEMethod": moe_clean_gpu_prefill_regular,
+    "CompressedTensorsWNA16MarlinMoEMethod": moe_clean_gpu_prefill_wna16,
+    "CompressedTensorsWNA16MoEMethod": moe_clean_gpu_prefill_wna16,
+    "Fp8MoEMethod": moe_clean_gpu_prefill_fp8,
+    "CompressedTensorsW8A8Fp8MoEMethod": moe_clean_gpu_prefill_fp8,
+}
+
+
+def _resolve_gpu_prefill_handler(layer, action: str):
+    quant_method_name = type(layer.quant_method).__name__
+    if not layer.supports_lk_gpu_prefill_quant_method():
+        raise ValueError(layer.format_lk_gpu_prefill_unsupported_message())
+
+    handlers = (
+        _GPU_PREFILL_PREPARE_HANDLERS
+        if action == "prepare"
+        else _GPU_PREFILL_CLEAN_HANDLERS
+    )
+    handler = handlers.get(quant_method_name)
+    if handler is not None:
+        return handler
+
+    support_matrix = layer.get_lk_gpu_prefill_support_matrix()
+    raise RuntimeError(
+        "Missing LK GPU prefill %s handler for quant_method=%s on layer=%s. "
+        "Support matrix=%s"
+        % (action, quant_method_name, layer.layer_name, support_matrix)
+    )
+
+
 def moe_prepare_gpu_prefill(layer, forward_context: ForwardContext, device: torch.device):
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MarlinMoEMethod
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MoEMethod  
-    from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod  
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Fp8MoEMethod
-    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
-    
-    if layer.is_gpu_prefill_layer: 
+    if layer.is_gpu_prefill_layer:
         with torch.no_grad():
-            # [global_num_experts, intermediate_size_per_partition * 2, hidden_size]
             prefetch_stream = forward_context._prefetch_stream
             prefetch_events = forward_context._prefetch_events
-        
+
             with torch.cuda.stream(prefetch_stream):
-                if isinstance(layer.quant_method, UnquantizedFusedMoEMethod):
-                    moe_prepare_gpu_prefill_regular(layer, forward_context, device)
-                elif (isinstance(layer.quant_method, CompressedTensorsWNA16MarlinMoEMethod) or isinstance(layer.quant_method, CompressedTensorsWNA16MoEMethod)) :
-                    moe_prepare_gpu_prefill_wna16(layer, forward_context, device)
-                elif isinstance(layer.quant_method, Fp8MoEMethod) or isinstance(layer.quant_method, CompressedTensorsW8A8Fp8MoEMethod):
-                    moe_prepare_gpu_prefill_fp8(layer, forward_context, device)
-                else:
-                    raise ValueError(f"Could not supported gpu prefill MOE type: {type(layer.lk_moe)} , please set LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0 to disable gpu prefill")
-                
+                prepare_handler = _resolve_gpu_prefill_handler(layer, action="prepare")
+                prepare_handler(layer, forward_context, device)
+
                 layer_id = id(layer)
                 event = torch.cuda.Event()
                 event.record(prefetch_stream)
                 prefetch_events[layer_id] = event
-        
-            
-def moe_clean_gpu_prefill(layer): 
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MarlinMoEMethod
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MoEMethod  
-    from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod  
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Fp8MoEMethod
-    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
-    
+
+
+def moe_clean_gpu_prefill(layer):
     with torch.no_grad():
-        if isinstance(layer.quant_method, UnquantizedFusedMoEMethod):
-            moe_clean_gpu_prefill_regular(layer)
-        elif (isinstance(layer.quant_method, CompressedTensorsWNA16MarlinMoEMethod) or isinstance(layer.quant_method, CompressedTensorsWNA16MoEMethod)) :
-            moe_clean_gpu_prefill_wna16(layer)
-        elif isinstance(layer.quant_method, Fp8MoEMethod) or isinstance(layer.quant_method, CompressedTensorsW8A8Fp8MoEMethod):
-            moe_clean_gpu_prefill_fp8(layer)
-        else:
-            raise ValueError(f"Could not supported gpu prefill MOE type: {type(layer.lk_moe)} , please set LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=0 to disable gpu prefill")
+        clean_handler = _resolve_gpu_prefill_handler(layer, action="clean")
+        clean_handler(layer)
 
 def moe_wait_prefetch(layer, hidden_states: torch.Tensor, forward_context: ForwardContext):
     if torch.cuda.is_current_stream_capturing():
