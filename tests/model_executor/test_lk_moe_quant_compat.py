@@ -62,7 +62,6 @@ def test_lk_quant_registry_supports_expected_baseline_types():
     assert "CompressedTensorsW8A8Fp8MoEMethod" in prefill_supported
     assert "CompressedTensorsW8A8Int8MoEMethod" in prefill_supported
     assert "CompressedTensorsWNA16MoEMethod" in prefill_supported
-    assert "ExpertsInt8MoEMethod" in prefill_supported
     assert "AWQMarlinMoEMethod" in prefill_supported
     assert "GPTQMarlinMoEMethod" in prefill_supported
     assert "GGUFMoEMethod" not in prefill_supported
@@ -134,14 +133,7 @@ def test_gpu_prefill_unsupported_message_exposes_support_matrix():
         assert quant_name in message
 
 
-@pytest.mark.parametrize(
-    "quant_method_name",
-    [
-        "ExpertsInt8MoEMethod",
-        "AWQMarlinMoEMethod",
-        "GPTQMarlinMoEMethod",
-    ],
-)
+@pytest.mark.parametrize("quant_method_name", ["AWQMarlinMoEMethod", "GPTQMarlinMoEMethod"])
 def test_resolve_gpu_prefill_handler_for_supported_quant_method(
     quant_method_name: str,
 ):

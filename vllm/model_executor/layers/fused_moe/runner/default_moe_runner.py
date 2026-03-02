@@ -1138,6 +1138,12 @@ def collect_weight_from_moe(layer, param_name: str) -> torch.Tensor:
     )
 
 
+def _has_lk_prefetch_metadata(layer, param_name: str) -> bool:
+    return hasattr(layer, param_name + "_origin_shape") and hasattr(
+        layer, param_name + "_origin_dtype"
+    )
+
+
 def _copy_or_replace_param(
     owner: object,
     param_name: str,
@@ -1280,6 +1286,8 @@ def _prepare_gpu_prefill_quant_params(
     for param_name in param_names:
         if not hasattr(layer, param_name):
             continue
+        if not _has_lk_prefetch_metadata(layer, param_name):
+            continue
         weight_cpu = collect_weight_from_moe(layer, param_name)
         _copy_or_replace_param(layer, param_name, weight_cpu, device)
 
@@ -1290,76 +1298,69 @@ def _clean_gpu_prefill_quant_params(layer, param_names: tuple[str, ...]):
         _empty_param(layer, param_name, device)
 
 
+def _get_awq_marlin_prefill_param_names(layer) -> tuple[str, ...]:
+    names: list[str] = [
+        "w13_qweight",
+        "w2_qweight",
+        "w13_scales",
+        "w2_scales",
+    ]
+    quant_config = getattr(layer.quant_method, "quant_config", None)
+    if bool(getattr(quant_config, "zero_point", True)):
+        names.extend(["w13_qzeros", "w2_qzeros"])
+    if hasattr(layer, "w13_input_global_scale"):
+        names.append("w13_input_global_scale")
+    if hasattr(layer, "w2_input_global_scale"):
+        names.append("w2_input_global_scale")
+    return tuple(names)
+
+
+def _get_gptq_marlin_prefill_param_names(layer) -> tuple[str, ...]:
+    names: list[str] = [
+        "w13_qweight",
+        "w2_qweight",
+        "w13_scales",
+        "w2_scales",
+    ]
+    quant_config = getattr(layer.quant_method, "quant_config", None)
+    if not bool(getattr(quant_config, "is_sym", True)):
+        names.extend(["w13_qzeros", "w2_qzeros"])
+    if bool(getattr(quant_config, "desc_act", False)):
+        names.extend(
+            [
+                "w13_g_idx",
+                "w2_g_idx",
+                "w13_g_idx_sort_indices",
+                "w2_g_idx_sort_indices",
+            ]
+        )
+    if hasattr(layer, "w13_input_global_scale"):
+        names.append("w13_input_global_scale")
+    if hasattr(layer, "w2_input_global_scale"):
+        names.append("w2_input_global_scale")
+    return tuple(names)
+
+
 def moe_prepare_gpu_prefill_awq_marlin(
     layer, forward_context: ForwardContext, device: torch.device
 ):
     del forward_context
-    _prepare_gpu_prefill_quant_params(
-        layer,
-        device,
-        (
-            "w13_qweight",
-            "w2_qweight",
-            "w13_scales",
-            "w2_scales",
-            "w13_qzeros",
-            "w2_qzeros",
-        ),
-    )
+    _prepare_gpu_prefill_quant_params(layer, device, _get_awq_marlin_prefill_param_names(layer))
 
 
 def moe_clean_gpu_prefill_awq_marlin(layer):
-    _clean_gpu_prefill_quant_params(
-        layer,
-        (
-            "w13_qweight",
-            "w2_qweight",
-            "w13_scales",
-            "w2_scales",
-            "w13_qzeros",
-            "w2_qzeros",
-        ),
-    )
+    _clean_gpu_prefill_quant_params(layer, _get_awq_marlin_prefill_param_names(layer))
 
 
 def moe_prepare_gpu_prefill_gptq_marlin(
     layer, forward_context: ForwardContext, device: torch.device
 ):
     del forward_context
-    _prepare_gpu_prefill_quant_params(
-        layer,
-        device,
-        (
-            "w13_qweight",
-            "w2_qweight",
-            "w13_scales",
-            "w2_scales",
-            "w13_qzeros",
-            "w2_qzeros",
-            "w13_g_idx",
-            "w2_g_idx",
-            "w13_g_idx_sort_indices",
-            "w2_g_idx_sort_indices",
-        ),
-    )
+    _prepare_gpu_prefill_quant_params(layer, device, _get_gptq_marlin_prefill_param_names(layer))
 
 
 def moe_clean_gpu_prefill_gptq_marlin(layer):
-    _clean_gpu_prefill_quant_params(
-        layer,
-        (
-            "w13_qweight",
-            "w2_qweight",
-            "w13_scales",
-            "w2_scales",
-            "w13_qzeros",
-            "w2_qzeros",
-            "w13_g_idx",
-            "w2_g_idx",
-            "w13_g_idx_sort_indices",
-            "w2_g_idx_sort_indices",
-        ),
-    )
+    _clean_gpu_prefill_quant_params(layer, _get_gptq_marlin_prefill_param_names(layer))
 
 
 def moe_prepare_gpu_prefill_wna16(

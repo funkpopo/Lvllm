@@ -166,25 +166,49 @@ class AwqMarlinLkAdapter(LkQuantAdapter):
         )
         layer._process_regular_weights()
 
-    def from_lk_storage(self, layer) -> None:
-        prefill_param_names = (
+    @staticmethod
+    def _prefill_param_names(layer) -> tuple[str, ...]:
+        names: list[str] = [
+            "w13_qweight",
+            "w2_qweight",
+            "w13_scales",
+            "w2_scales",
+        ]
+        quant_config = getattr(layer.quant_method, "quant_config", None)
+        use_zero_point = bool(getattr(quant_config, "zero_point", True))
+        if use_zero_point:
+            names.extend(["w13_qzeros", "w2_qzeros"])
+
+        if hasattr(layer, "w13_input_global_scale"):
+            names.append("w13_input_global_scale")
+        if hasattr(layer, "w2_input_global_scale"):
+            names.append("w2_input_global_scale")
+        return tuple(names)
+
+    @staticmethod
+    def _release_param_names() -> tuple[str, ...]:
+        return (
             "w13_qweight",
             "w2_qweight",
             "w13_scales",
             "w2_scales",
             "w13_qzeros",
             "w2_qzeros",
+            "w13_input_global_scale",
+            "w2_input_global_scale",
             "w13_g_idx_sort_indices",
             "w2_g_idx_sort_indices",
-        )
-        cleanup_only_names = (
             "w13_weight",
             "w2_weight",
         )
 
+    def from_lk_storage(self, layer) -> None:
+        prefill_param_names = self._prefill_param_names(layer)
+        release_names = self._release_param_names()
         device = torch.device(torch.cuda.current_device())
+
         if layer.is_cpu_layer:
-            for name in (*prefill_param_names, *cleanup_only_names):
+            for name in release_names:
                 if hasattr(layer, name):
                     setattr(
                         layer,
@@ -195,18 +219,24 @@ class AwqMarlinLkAdapter(LkQuantAdapter):
                     )
             return
 
+        distributed_names: set[str] = set()
         for name in prefill_param_names:
             if not hasattr(layer, name):
                 continue
             weight = getattr(layer, name)
+            if not isinstance(weight, torch.Tensor) or weight.numel() == 0:
+                continue
             layer.distribute_weight_tensor(name, weight)
+            distributed_names.add(name)
             setattr(
                 layer,
                 name,
                 torch.nn.Parameter(torch.empty(0, device=device), requires_grad=False),
             )
 
-        for name in cleanup_only_names:
+        for name in release_names:
+            if name in distributed_names:
+                continue
             if hasattr(layer, name):
                 setattr(
                     layer,
