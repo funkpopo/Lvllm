@@ -2593,6 +2593,97 @@ class FusedMoE(CustomOp):
                             f"Maximum available buffer size: {cuda_graphs[-1]}")
         
         return best_index
+
+    def _get_normal_prefill_bucket_size(self, batch_size: int) -> int:
+        if batch_size <= 1:
+            return 1
+        return 1 << (batch_size - 1).bit_length()
+
+    def _allocate_normal_prefill_pool_slot(
+        self,
+        bucket_size: int,
+        device_id: int,
+    ) -> dict[str, object]:
+        pin_memory = is_pin_memory_available()
+        buff_dtype = self.moe_config.in_dtype
+        hidden_size = self.hidden_size
+        num_experts_per_tok = self.top_k
+        return {
+            "input_cpu": torch.empty(
+                (bucket_size, hidden_size),
+                device="cpu",
+                dtype=buff_dtype,
+                pin_memory=pin_memory,
+                requires_grad=False,
+            ).contiguous(),
+            "expert_ids_cpu": torch.empty(
+                (bucket_size, num_experts_per_tok),
+                device="cpu",
+                dtype=torch.int32,
+                pin_memory=pin_memory,
+                requires_grad=False,
+            ).contiguous(),
+            "weights_cpu": torch.empty(
+                (bucket_size, num_experts_per_tok),
+                device="cpu",
+                dtype=torch.float32,
+                pin_memory=pin_memory,
+                requires_grad=False,
+            ).contiguous(),
+            "output_cpu": torch.empty(
+                (bucket_size, hidden_size),
+                device="cpu",
+                dtype=buff_dtype,
+                pin_memory=pin_memory,
+                requires_grad=False,
+            ).contiguous(),
+            "bsz_tensor": torch.empty(
+                (1),
+                device="cpu",
+                dtype=torch.int32,
+                pin_memory=pin_memory,
+                requires_grad=False,
+            ).contiguous(),
+            "release_event": None,
+            "device_id": device_id,
+            "bucket_size": bucket_size,
+        }
+
+    def _acquire_normal_prefill_pool_slot(
+        self,
+        batch_size: int,
+        device_id: int,
+    ) -> dict[str, object]:
+        if not hasattr(FusedMoE, "_normal_prefill_pinned_pool"):
+            FusedMoE._normal_prefill_pinned_pool = {}
+        if not hasattr(FusedMoE, "_normal_prefill_pool_size"):
+            # Two slots per bucket keep one-step overlap without unbounded growth.
+            FusedMoE._normal_prefill_pool_size = 2
+
+        bucket_size = self._get_normal_prefill_bucket_size(batch_size)
+        device_pool = FusedMoE._normal_prefill_pinned_pool.setdefault(device_id, {})
+        bucket_pool = device_pool.get(bucket_size)
+        if bucket_pool is None:
+            slots = [
+                self._allocate_normal_prefill_pool_slot(bucket_size, device_id)
+                for _ in range(FusedMoE._normal_prefill_pool_size)
+            ]
+            bucket_pool = {
+                "slots": slots,
+                "next_slot": 0,
+            }
+            device_pool[bucket_size] = bucket_pool
+
+        slots = bucket_pool["slots"]
+        slot_idx = bucket_pool["next_slot"]
+        slot = slots[slot_idx]
+        bucket_pool["next_slot"] = (slot_idx + 1) % len(slots)
+
+        release_event = cast(torch.cuda.Event | None, slot["release_event"])
+        if release_event is not None:
+            release_event.synchronize()
+            slot["release_event"] = None
+        return slot
     
     def _process_valid_inputs(self, hidden_states: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
         """Process inputs that are guaranteed to be valid (non-NaN)"""
@@ -2672,38 +2763,69 @@ class FusedMoE(CustomOp):
                 with self._normal_prefill_lock:
                     if not hasattr(self, '_normal_prefill_stream'):
                         self._normal_prefill_stream = torch.cuda.Stream() 
-                        
-                    current_stream = torch.cuda.current_stream()
+
+                    current_cuda_stream = torch.cuda.current_stream()
+                    prefill_stream = self._normal_prefill_stream
+                    prefill_stream_ptr = get_cuda_stream_ptr(prefill_stream)
                     wait_event = torch.cuda.Event()
-                    wait_event.record(current_stream)
+                    wait_event.record(current_cuda_stream)
+
+                    slot = self._acquire_normal_prefill_pool_slot(
+                        batch_size,
+                        current_device,
+                    )
+                    input_tensor_cpu = cast(torch.Tensor, slot["input_cpu"])
+                    expert_ids_cpu = cast(torch.Tensor, slot["expert_ids_cpu"])
+                    weights_cpu = cast(torch.Tensor, slot["weights_cpu"])
+                    output_cpu = cast(torch.Tensor, slot["output_cpu"])
+                    bsz_tensor = cast(torch.Tensor, slot["bsz_tensor"])
+
+                    output_gpu = torch.empty_like(
+                        hidden_states,
+                        device=current_device,
+                    ).contiguous()
+                    complete_event = torch.cuda.Event()
+                    slot_release_event = torch.cuda.Event()
                     
-                    with torch.cuda.stream(self._normal_prefill_stream):
-                        self._normal_prefill_stream.wait_event(wait_event)
-                        
-                        expert_ids_cpu = topk_ids.to(dtype=torch.int32, device='cpu', memory_format=torch.contiguous_format, non_blocking=non_blocking)
-                        weights_cpu = topk_weights.to(dtype=torch.float32, device='cpu', memory_format=torch.contiguous_format, non_blocking=non_blocking)
-                        hidden_states_cpu = hidden_states.to(device='cpu', memory_format=torch.contiguous_format, non_blocking=non_blocking)
-                        output_cpu = torch.empty_like(hidden_states, device='cpu').contiguous()
-                        bsz_tensor = torch.tensor([hidden_states.size(0)], device='cpu', dtype=torch.int32).contiguous()
-                        
-                        self._normal_prefill_stream.synchronize()
-                        
-                        self.lk_moe.forward(
-                            hidden_states.size(0),                         # qlen
-                            expert_ids_cpu.size(1),                    # k
-                            expert_ids_cpu.data_ptr(),                 # expert_ids
-                            weights_cpu.data_ptr(),                    # weights
-                            hidden_states_cpu.data_ptr(),              # input
-                            output_cpu.data_ptr(),                     # output 
-                            bsz_tensor.data_ptr()                      # bsz_tensor
-                        )     
-                        output_gpu = output_cpu.to(torch.cuda.current_device(), non_blocking=non_blocking)
+                    with torch.cuda.stream(prefill_stream):
+                        prefill_stream.wait_event(wait_event)
+                        input_tensor_cpu[:batch_size].copy_(
+                            hidden_states,
+                            non_blocking=non_blocking,
+                        )
+                        expert_ids_cpu[:batch_size].copy_(
+                            topk_ids.to(dtype=torch.int32, copy=False),
+                            non_blocking=non_blocking,
+                        )
+                        weights_cpu[:batch_size].copy_(
+                            topk_weights.to(dtype=torch.float32, copy=False),
+                            non_blocking=non_blocking,
+                        )
+                        bsz_tensor[0] = batch_size
+
+                        self.lk_moe.submit_with_cuda_stream(
+                            prefill_stream_ptr,
+                            batch_size,                               # qlen
+                            expert_ids_cpu.size(1),                  # k
+                            expert_ids_cpu.data_ptr(),               # expert_ids
+                            weights_cpu.data_ptr(),                  # weights
+                            input_tensor_cpu.data_ptr(),             # input
+                            output_cpu.data_ptr(),                   # output
+                            bsz_tensor.data_ptr(),                   # bsz_tensor
+                        )
+                        self.lk_moe.sync_with_cuda_stream(prefill_stream_ptr)
+
+                        output_gpu.copy_(
+                            output_cpu[:batch_size],
+                            non_blocking=non_blocking,
+                        )
                         if self.check_nan_in_output:
                             torch.nan_to_num(output_gpu, nan=0.0, out=output_gpu)
-                        complete_event = torch.cuda.Event()
-                        complete_event.record(self._normal_prefill_stream)
+                        complete_event.record(prefill_stream)
+                        slot_release_event.record(prefill_stream)
+                    slot["release_event"] = slot_release_event
                     
-                    current_stream.wait_event(complete_event)
+                    current_cuda_stream.wait_event(complete_event)
         
                     return output_gpu
        

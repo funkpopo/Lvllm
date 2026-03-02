@@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import (
     aux_stream,
     current_stream,
@@ -37,15 +38,16 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-logger = init_logger(__name__)
-from vllm.utils.platform_utils import is_pin_memory_available
-
 from vllm.envs import (
+    extract_layer_index,
     get_gpu_prefetch_window,
     get_gpu_prefill_min_batch_size,
-    is_lk_moe_gpu_resident_layer,
     is_lk_moe_use_gpu_prefill,
 )
+
+logger = init_logger(__name__)
+
+
 def get_layer_from_name(layer_name: str) -> torch.nn.Module:
     forward_context: ForwardContext = get_forward_context()
     if layer_name == "from_forward_context":
@@ -61,6 +63,62 @@ def get_layer_from_name(layer_name: str) -> torch.nn.Module:
         layer_name = all_moe_layers[moe_layer_index]
         forward_context.moe_layer_index += 1
     return forward_context.no_compile_layers[layer_name]
+
+
+def _is_prefetch_managed_moe_layer(layer_obj: object) -> bool:
+    return hasattr(layer_obj, "is_gpu_prefill_layer") and hasattr(
+        layer_obj, "is_gpu_resident_layer"
+    )
+
+
+def _fallback_moe_layer_sort_key(layer_name: str) -> tuple[int, int, str]:
+    try:
+        return (0, extract_layer_index(layer_name), layer_name)
+    except Exception:
+        # Keep unknown naming patterns deterministic without blocking prefetch.
+        return (1, 0, layer_name)
+
+
+def _get_prefetch_layer_order(
+    forward_context: ForwardContext,
+) -> tuple[list[str], dict[str, int]]:
+    ordered_names = getattr(forward_context, "_moe_prefetch_ordered_layers", None)
+    layer_positions = getattr(forward_context, "_moe_prefetch_layer_positions", None)
+    if ordered_names is not None and layer_positions is not None:
+        return ordered_names, layer_positions
+
+    ordered_names = []
+    seen_names: set[str] = set()
+
+    # Prefer static execution order if available.
+    source_names = (
+        forward_context.all_moe_layers
+        if forward_context.all_moe_layers is not None
+        else list(forward_context.no_compile_layers.keys())
+    )
+    for candidate_name in source_names:
+        if candidate_name in seen_names:
+            continue
+        layer_obj = forward_context.no_compile_layers.get(candidate_name)
+        if layer_obj is None or not _is_prefetch_managed_moe_layer(layer_obj):
+            continue
+        ordered_names.append(candidate_name)
+        seen_names.add(candidate_name)
+
+    if not ordered_names:
+        for candidate_name, layer_obj in forward_context.no_compile_layers.items():
+            if candidate_name in seen_names:
+                continue
+            if not _is_prefetch_managed_moe_layer(layer_obj):
+                continue
+            ordered_names.append(candidate_name)
+            seen_names.add(candidate_name)
+        ordered_names.sort(key=_fallback_moe_layer_sort_key)
+
+    layer_positions = {name: idx for idx, name in enumerate(ordered_names)}
+    setattr(forward_context, "_moe_prefetch_ordered_layers", ordered_names)
+    setattr(forward_context, "_moe_prefetch_layer_positions", layer_positions)
+    return ordered_names, layer_positions
 
 
 def _should_use_lk_cpu_path(layer: torch.nn.Module, hidden_states: torch.Tensor) -> bool:
@@ -862,9 +920,6 @@ class DefaultMoERunner(MoERunner):
                 return combine_output(final_hidden_states)
     
     
-            
-
-from vllm.envs import extract_layer_index    
 def moe_cleanup(layer, layer_name: str, hidden_states: torch.Tensor, 
                 forward_context: ForwardContext): 
     if torch.cuda.is_current_stream_capturing():
@@ -879,8 +934,11 @@ def moe_cleanup(layer, layer_name: str, hidden_states: torch.Tensor,
     if not layer.should_use_gpu_prefill(hidden_states):
         return
     
-    
-    layer_idx = extract_layer_index(layer_name)
+    _, layer_positions = _get_prefetch_layer_order(forward_context)
+    layer_position = layer_positions.get(layer_name)
+    if layer_position is None:
+        return
+
     batch_key = id(forward_context.batch_descriptor)
      
     if not hasattr(forward_context, '_batch_prefetch_states'):
@@ -889,19 +947,22 @@ def moe_cleanup(layer, layer_name: str, hidden_states: torch.Tensor,
         return
     
     batch_state = forward_context._batch_prefetch_states[batch_key]
-    state = batch_state['state']
+    prefetched_layers = batch_state['prefetched_layers']
      
-    keys_to_clean = [k for k in state.keys() if k <= layer_idx]
+    keys_to_clean = [
+        candidate_name
+        for candidate_name in list(prefetched_layers)
+        if layer_positions.get(candidate_name, -1) <= layer_position
+    ]
     
-    for k in keys_to_clean: 
-        candidate_name = layer_name.replace(f".{layer_idx}.", f".{k}.")
-        if is_lk_moe_gpu_resident_layer(candidate_name):
-            del state[k]
-            continue  
+    for candidate_name in keys_to_clean:
         layer_obj = forward_context.no_compile_layers.get(candidate_name)
+        if layer_obj and layer_obj.is_gpu_resident_layer:
+            prefetched_layers.discard(candidate_name)
+            continue
         if layer_obj:
             moe_clean_gpu_prefill(layer_obj)
-        del state[k]
+        prefetched_layers.discard(candidate_name)
         if hasattr(forward_context, '_prefetch_events'):  
             if layer_obj:
                 layer_id = id(layer_obj)
@@ -930,7 +991,11 @@ def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor,
     if not hasattr(forward_context, '_prefetch_events'):
         forward_context._prefetch_events = {}  # layer_id -> event
     
-    layer_idx = extract_layer_index(layer_name)
+    ordered_names, layer_positions = _get_prefetch_layer_order(forward_context)
+    layer_position = layer_positions.get(layer_name)
+    if layer_position is None:
+        return
+
     batch_key = id(forward_context.batch_descriptor) 
     
     if not hasattr(forward_context, '_batch_prefetch_states'):
@@ -938,17 +1003,20 @@ def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor,
     
     if batch_key not in forward_context._batch_prefetch_states:
         forward_context._batch_prefetch_states[batch_key] = {
-            'state': {},  # layer_idx -> prefetch_count
-            'called_layers': set()
+            'prefetched_layers': set(),
+            'called_layers': set(),
+            'last_position': -1,
         }
     
     batch_state = forward_context._batch_prefetch_states[batch_key]
-    state = batch_state['state']
+    prefetched_layers = batch_state['prefetched_layers']
     called_layers = batch_state['called_layers']
+    last_position = batch_state['last_position']
      
-    if layer_idx == 0:
-        state.clear()
+    if layer_position <= last_position:
+        prefetched_layers.clear()
         called_layers.clear()
+    batch_state['last_position'] = layer_position
      
     if layer_name in called_layers:
         return
@@ -956,34 +1024,31 @@ def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor,
     called_layers.add(layer_name)  
             
     active_prefetches = 0
-    for k in state.keys():
-        candidate_name = layer_name.replace(f".{layer_idx}.", f".{k}.")
-        if not is_lk_moe_gpu_resident_layer(candidate_name):
+    for candidate_name in prefetched_layers:
+        candidate_layer = forward_context.no_compile_layers.get(candidate_name)
+        if candidate_layer is not None and not candidate_layer.is_gpu_resident_layer:
             active_prefetches += 1
      
     available_slots = gpu_prefetch_window - active_prefetches
     
-    layer_count = len(forward_context.no_compile_layers)
     if available_slots > 0: 
-        prefetch_candidates = [] 
-        for offset in range(0, layer_count): 
-            candidate_idx = layer_idx + offset
-            candidate_name = layer_name.replace(f".{layer_idx}.", f".{candidate_idx}.")
-            
-            if candidate_name not in forward_context.no_compile_layers:
-                break  
-             
-            if is_lk_moe_gpu_resident_layer(candidate_name):
+        prefetch_candidates = []
+        for candidate_name in ordered_names[layer_position:]:
+            if len(prefetch_candidates) >= available_slots:
+                break
+            if candidate_name in prefetched_layers:
                 continue
-             
-            if candidate_idx not in state and len(prefetch_candidates) < available_slots:
-                candidate_layer = forward_context.no_compile_layers.get(candidate_name)
-                if candidate_layer and candidate_layer.is_gpu_prefill_layer:
-                    prefetch_candidates.append((candidate_idx, candidate_layer))
+            candidate_layer = forward_context.no_compile_layers.get(candidate_name)
+            if candidate_layer is None:
+                continue
+            if candidate_layer.is_gpu_resident_layer:
+                continue
+            if candidate_layer.is_gpu_prefill_layer:
+                prefetch_candidates.append((candidate_name, candidate_layer))
          
-        for idx, layer_obj in prefetch_candidates:
+        for candidate_name, layer_obj in prefetch_candidates:
             moe_prepare_gpu_prefill(layer_obj, forward_context, torch.cuda.current_device())
-            state[idx] = 1   
+            prefetched_layers.add(candidate_name)
             
 def collect_weight_from_moe(layer, param_name: str) -> torch.Tensor:
     pin_memory = is_pin_memory_available()

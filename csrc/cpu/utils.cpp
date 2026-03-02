@@ -3,6 +3,7 @@
   #include <unistd.h>
   #include <string>
   #include <sched.h>
+  #include <algorithm>
 #endif
 #if __GLIBC__ == 2 && __GLIBC_MINOR__ < 30
   #include <unistd.h>
@@ -65,13 +66,21 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
 
       bitmask* mask = numa_parse_nodestring(node_ids_str.c_str());
       bitmask* src_mask = numa_get_mems_allowed();
+      bitmask* migrate_src_mask = numa_allocate_nodemask();
 
       int pid = getpid();
 
-      if (mask && src_mask) {
+      if (mask && src_mask && migrate_src_mask) {
         // move all existing pages to the specified numa node.
-        *(src_mask->maskp) = *(src_mask->maskp) ^ *(mask->maskp);
-        int page_num = numa_migrate_pages(pid, src_mask, mask);
+        numa_bitmask_clearall(migrate_src_mask);
+        constexpr int group_size = 8 * sizeof(*src_mask->maskp);
+        const unsigned long bit_count = std::min(mask->size, src_mask->size);
+        const unsigned long group_count =
+            (bit_count + group_size - 1) / group_size;
+        for (unsigned long i = 0; i < group_count; ++i) {
+          migrate_src_mask->maskp[i] = src_mask->maskp[i] & ~mask->maskp[i];
+        }
+        int page_num = numa_migrate_pages(pid, migrate_src_mask, mask);
         if (page_num == -1) {
           TORCH_WARN("numa_migrate_pages failed. errno: " +
                      std::to_string(errno));
@@ -113,9 +122,19 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
 
         numa_free_nodemask(mask);
         numa_free_nodemask(src_mask);
+        numa_free_nodemask(migrate_src_mask);
       } else {
+        if (mask != nullptr) {
+          numa_free_nodemask(mask);
+        }
+        if (src_mask != nullptr) {
+          numa_free_nodemask(src_mask);
+        }
+        if (migrate_src_mask != nullptr) {
+          numa_free_nodemask(migrate_src_mask);
+        }
         TORCH_WARN(
-            "numa_parse_nodestring or numa_get_run_node_mask failed. errno: " +
+            "Failed to initialize NUMA migration masks. errno: " +
             std::to_string(errno));
       }
     }

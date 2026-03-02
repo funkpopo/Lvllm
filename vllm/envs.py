@@ -218,6 +218,8 @@ if TYPE_CHECKING:
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
     LVLLM_MOE_NUMA_ENABLED: bool = False
     LVLLM_ENABLE_NUMA_INTERLEAVE: bool = False
+    LVLLM_NUMA_BIND_STRATEGY: Literal["gpu_local", "interleave"] = "gpu_local"
+    LVLLM_NUMACTL_ARGS_OVERRIDE: str | None = None
     LVLLM_MOE_QUANT_ON_GPU: bool = False
     LVLLM_MOE_USE_WEIGHT: Literal["KEEP", "TO_DTYPE", "INT4"] = "INT4"
     LVLLM_GPU_RESIDENT_MOE_LAYERS: str | None = None
@@ -1559,6 +1561,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "LVLLM_ENABLE_NUMA_INTERLEAVE": lambda: bool(
         int(os.getenv("LVLLM_ENABLE_NUMA_INTERLEAVE", "0"))
     ),
+    # NUMA binding strategy for multiprocessing workers.
+    "LVLLM_NUMA_BIND_STRATEGY": env_with_choices(
+        "LVLLM_NUMA_BIND_STRATEGY",
+        "gpu_local",
+        ["gpu_local", "interleave"],
+        case_sensitive=False,
+    ),
+    # Explicit numactl arguments override, e.g.
+    # "--cpunodebind=0 --membind=0" or "--interleave=all".
+    "LVLLM_NUMACTL_ARGS_OVERRIDE": lambda: os.environ.get(
+        "LVLLM_NUMACTL_ARGS_OVERRIDE", None
+    ),
     "LVLLM_MOE_QUANT_ON_GPU": lambda: bool(
         int(os.getenv("LVLLM_MOE_QUANT_ON_GPU", "0"))
     ),
@@ -1769,6 +1783,8 @@ def compile_factors() -> dict[str, object]:
         "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE",
         "LVLLM_GPU_PREFETCH_WINDOW",
         "LVLLM_ENABLE_NUMA_INTERLEAVE",
+        "LVLLM_NUMA_BIND_STRATEGY",
+        "LVLLM_NUMACTL_ARGS_OVERRIDE",
         "LVLLM_MOE_QUANT_ON_GPU",
     }
 
@@ -1835,6 +1851,23 @@ def is_lk_moe_feature_enabled() -> bool:
 
 def is_numa_interleave_enabled() -> bool:
     return environment_variables["LVLLM_ENABLE_NUMA_INTERLEAVE"]()
+
+
+def get_numa_bind_strategy() -> str:
+    strategy = environment_variables["LVLLM_NUMA_BIND_STRATEGY"]()
+    if strategy is None:
+        return "gpu_local"
+    return str(strategy).strip().lower()
+
+
+def get_numa_numactl_args_override() -> str | None:
+    override = environment_variables["LVLLM_NUMACTL_ARGS_OVERRIDE"]()
+    if override is None:
+        return None
+    override = str(override).strip()
+    return override if override else None
+
+
 def is_lk_moe_quant_on_gpu() -> bool:
     return environment_variables["LVLLM_MOE_QUANT_ON_GPU"]()
 

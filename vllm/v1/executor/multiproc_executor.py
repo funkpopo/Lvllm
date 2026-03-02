@@ -5,20 +5,24 @@ import os
 import pickle
 import queue
 import signal
+import atexit
+import shlex
 import threading
+import tempfile
 import time
 import traceback
 import weakref
 from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, InvalidStateError
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cached_property, partial
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Lock as LockType
+from pathlib import Path
 from threading import Thread
 from typing import Any, cast
 
@@ -59,6 +63,9 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOu
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
+
+_NUMACTL_WRAPPER_PATHS: set[str] = set()
+_NUMACTL_WRAPPER_LOCK = threading.Lock()
 
 
 class FutureWrapper(Future):
@@ -618,12 +625,16 @@ class WorkerProc:
             name=f"VllmWorker-{rank}",
             daemon=True,
         )
-        from vllm.envs import is_numa_interleave_enabled
-        if is_numa_interleave_enabled(): 
-            numactl_args = "--interleave=all" 
-            executable = _create_numactl_executable(numactl_args) 
-            multiprocessing.spawn.set_executable(executable) 
-        proc.start()
+        numactl_args = _get_numactl_args_for_worker(local_rank)
+        if numactl_args is None:
+            proc.start()
+        else:
+            executable = _create_numactl_executable(numactl_args)
+            try:
+                with _mp_set_executable(executable):
+                    proc.start()
+            finally:
+                _cleanup_numactl_executable(executable)
         writer.close()
         # Keep death_writer open in parent - when parent exits,
         # death_reader in child will get EOFError
@@ -932,24 +943,136 @@ def set_multiprocessing_worker_envs():
         os.environ["OMP_NUM_THREADS"] = str(default_omp_num_threads)
         torch.set_num_threads(default_omp_num_threads)
 
-import os
-import random
-import time
-from pathlib import Path
-def _create_numactl_executable(numactl_args: str): 
-    old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
-    script = f'''#!/bin/sh
-exec numactl {numactl_args} {old_executable} "$@"'''
-    path = Path(
-        f"/tmp/vllm_temp_file_{time.time()}_{random.randrange(0, 10000000)}.sh"
-    )
-    path.write_text(script)
-    path.chmod(0o777)
-    return str(path)
+def _normalize_pci_bus_id_for_sysfs(bus_id: str) -> str:
+    domain, bus, slot_func = bus_id.strip().split(":", 2)
+    # PyTorch may expose 8-digit PCI domain; sysfs expects 4 digits.
+    return f"{domain[-4:].zfill(4)}:{bus}:{slot_func}"
 
-from contextlib import contextmanager
+
+def _get_gpu_numa_node(local_rank: int) -> int | None:
+    if not torch.cuda.is_available():
+        return None
+
+    try:
+        props = torch.cuda.get_device_properties(local_rank)
+    except Exception:
+        return None
+
+    raw_bus_id = getattr(props, "pci_bus_id", None)
+    if not raw_bus_id:
+        return None
+
+    try:
+        normalized_bus_id = _normalize_pci_bus_id_for_sysfs(raw_bus_id)
+    except Exception:
+        return None
+
+    numa_node_path = Path("/sys/bus/pci/devices") / normalized_bus_id / "numa_node"
+    if not numa_node_path.exists():
+        return None
+
+    try:
+        numa_node = int(numa_node_path.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+
+    if numa_node < 0:
+        return None
+    return numa_node
+
+
+def _get_numactl_args_for_worker(local_rank: int) -> str | None:
+    from vllm.envs import (
+        get_numa_bind_strategy,
+        get_numa_numactl_args_override,
+        is_numa_interleave_enabled,
+    )
+
+    if not is_numa_interleave_enabled():
+        return None
+
+    override_args = get_numa_numactl_args_override()
+    if override_args is not None:
+        return override_args
+
+    strategy = get_numa_bind_strategy()
+    if strategy == "interleave":
+        return "--interleave=all"
+    if strategy != "gpu_local":
+        logger.warning_once(
+            "Unknown LVLLM_NUMA_BIND_STRATEGY=%s. "
+            "Fallback to --interleave=all.",
+            strategy,
+        )
+        return "--interleave=all"
+
+    numa_node = _get_gpu_numa_node(local_rank)
+    if numa_node is None:
+        logger.warning_once(
+            "Failed to resolve GPU NUMA node for local_rank=%d. "
+            "Fallback to --interleave=all.",
+            local_rank,
+        )
+        return "--interleave=all"
+    return f"--cpunodebind={numa_node} --membind={numa_node}"
+
+
+def _create_numactl_executable(numactl_args: str) -> str:
+    old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
+    try:
+        args = shlex.split(numactl_args)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid numactl args in LVLLM_NUMACTL_ARGS_OVERRIDE: {numactl_args}"
+        ) from exc
+
+    quoted_args = " ".join(shlex.quote(arg) for arg in args)
+    quoted_executable = shlex.quote(old_executable)
+    script = (
+        "#!/bin/sh\n"
+        f"exec numactl {quoted_args} {quoted_executable} \"$@\"\n"
+    )
+
+    fd, path = tempfile.mkstemp(prefix="vllm_numactl_", suffix=".sh")
+    with os.fdopen(fd, "w", encoding="utf-8") as file:
+        file.write(script)
+    os.chmod(path, 0o700)
+    with _NUMACTL_WRAPPER_LOCK:
+        _NUMACTL_WRAPPER_PATHS.add(path)
+    return path
+
+
+def _cleanup_numactl_executable(executable: str) -> None:
+    try:
+        os.remove(executable)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.warning("Failed to remove numactl wrapper %s: %s", executable, exc)
+    finally:
+        with _NUMACTL_WRAPPER_LOCK:
+            _NUMACTL_WRAPPER_PATHS.discard(executable)
+
+
+def _cleanup_numactl_executables() -> None:
+    with _NUMACTL_WRAPPER_LOCK:
+        paths = list(_NUMACTL_WRAPPER_PATHS)
+        _NUMACTL_WRAPPER_PATHS.clear()
+    for executable in paths:
+        try:
+            os.remove(executable)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            # Avoid raising in atexit path.
+            continue
+
+
+atexit.register(_cleanup_numactl_executables)
+
+
 @contextmanager
-def _mp_set_executable(executable: str): 
+def _mp_set_executable(executable: str):
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
     multiprocessing.spawn.set_executable(executable)
     try:
@@ -958,9 +1081,12 @@ def _mp_set_executable(executable: str):
         multiprocessing.spawn.set_executable(old_executable)
 
 
-def set_multiprocessing_interleave(): 
+def set_multiprocessing_interleave():
     numactl_args = "--interleave=all"
     executable = _create_numactl_executable(numactl_args=numactl_args)
-    logger.info(f"Setting multiprocessing executable to {executable} "
-                f"with numactl args: {numactl_args}")
+    logger.info(
+        "Setting multiprocessing executable to %s with numactl args: %s",
+        executable,
+        numactl_args,
+    )
     return executable
