@@ -1274,6 +1274,94 @@ def moe_clean_gpu_prefill_channel_scale(layer):
         _empty_param(layer, param_name, device)
 
 
+def _prepare_gpu_prefill_quant_params(
+    layer, device: torch.device, param_names: tuple[str, ...]
+):
+    for param_name in param_names:
+        if not hasattr(layer, param_name):
+            continue
+        weight_cpu = collect_weight_from_moe(layer, param_name)
+        _copy_or_replace_param(layer, param_name, weight_cpu, device)
+
+
+def _clean_gpu_prefill_quant_params(layer, param_names: tuple[str, ...]):
+    device = torch.device(torch.cuda.current_device())
+    for param_name in param_names:
+        _empty_param(layer, param_name, device)
+
+
+def moe_prepare_gpu_prefill_awq_marlin(
+    layer, forward_context: ForwardContext, device: torch.device
+):
+    del forward_context
+    _prepare_gpu_prefill_quant_params(
+        layer,
+        device,
+        (
+            "w13_qweight",
+            "w2_qweight",
+            "w13_scales",
+            "w2_scales",
+            "w13_qzeros",
+            "w2_qzeros",
+        ),
+    )
+
+
+def moe_clean_gpu_prefill_awq_marlin(layer):
+    _clean_gpu_prefill_quant_params(
+        layer,
+        (
+            "w13_qweight",
+            "w2_qweight",
+            "w13_scales",
+            "w2_scales",
+            "w13_qzeros",
+            "w2_qzeros",
+        ),
+    )
+
+
+def moe_prepare_gpu_prefill_gptq_marlin(
+    layer, forward_context: ForwardContext, device: torch.device
+):
+    del forward_context
+    _prepare_gpu_prefill_quant_params(
+        layer,
+        device,
+        (
+            "w13_qweight",
+            "w2_qweight",
+            "w13_scales",
+            "w2_scales",
+            "w13_qzeros",
+            "w2_qzeros",
+            "w13_g_idx",
+            "w2_g_idx",
+            "w13_g_idx_sort_indices",
+            "w2_g_idx_sort_indices",
+        ),
+    )
+
+
+def moe_clean_gpu_prefill_gptq_marlin(layer):
+    _clean_gpu_prefill_quant_params(
+        layer,
+        (
+            "w13_qweight",
+            "w2_qweight",
+            "w13_scales",
+            "w2_scales",
+            "w13_qzeros",
+            "w2_qzeros",
+            "w13_g_idx",
+            "w2_g_idx",
+            "w13_g_idx_sort_indices",
+            "w2_g_idx_sort_indices",
+        ),
+    )
+
+
 def moe_prepare_gpu_prefill_wna16(
     layer, forward_context: ForwardContext, device: torch.device
 ):
@@ -1400,6 +1488,8 @@ _GPU_PREFILL_PREPARE_HANDLERS: dict[
     "CompressedTensorsW8A8Fp8MoEMethod": moe_prepare_gpu_prefill_fp8,
     "CompressedTensorsW8A8Int8MoEMethod": moe_prepare_gpu_prefill_channel_scale,
     "ExpertsInt8MoEMethod": moe_prepare_gpu_prefill_channel_scale,
+    "AWQMarlinMoEMethod": moe_prepare_gpu_prefill_awq_marlin,
+    "GPTQMarlinMoEMethod": moe_prepare_gpu_prefill_gptq_marlin,
 }
 
 _GPU_PREFILL_CLEAN_HANDLERS: dict[str, Callable[[torch.nn.Module], None]] = {
@@ -1410,6 +1500,8 @@ _GPU_PREFILL_CLEAN_HANDLERS: dict[str, Callable[[torch.nn.Module], None]] = {
     "CompressedTensorsW8A8Fp8MoEMethod": moe_clean_gpu_prefill_fp8,
     "CompressedTensorsW8A8Int8MoEMethod": moe_clean_gpu_prefill_channel_scale,
     "ExpertsInt8MoEMethod": moe_clean_gpu_prefill_channel_scale,
+    "AWQMarlinMoEMethod": moe_clean_gpu_prefill_awq_marlin,
+    "GPTQMarlinMoEMethod": moe_clean_gpu_prefill_gptq_marlin,
 }
 
 

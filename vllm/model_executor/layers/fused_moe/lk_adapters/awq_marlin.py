@@ -16,7 +16,7 @@ class AwqMarlinLkAdapter(LkQuantAdapter):
     spec = LkQuantAdapterSpec(
         quant_method_names=frozenset({"AWQMarlinMoEMethod"}),
         supports_cpu_path=True,
-        supports_gpu_prefill=False,
+        supports_gpu_prefill=True,
         supports_vllm_fallback=True,
     )
 
@@ -160,15 +160,14 @@ class AwqMarlinLkAdapter(LkQuantAdapter):
         layer.w2_weight = torch.nn.Parameter(w2_tensor, requires_grad=False)
 
         logger.info_once(
-            "Use AWQ dequantized LK CPU path for layer=%s quant_method=%s. "
-            "GPU prefill remains disabled for this quantization.",
+            "Use AWQ dequantized LK CPU path for layer=%s quant_method=%s.",
             layer.layer_name,
             type(layer.quant_method).__name__,
         )
         layer._process_regular_weights()
 
     def from_lk_storage(self, layer) -> None:
-        param_names = (
+        prefill_param_names = (
             "w13_qweight",
             "w2_qweight",
             "w13_scales",
@@ -177,16 +176,40 @@ class AwqMarlinLkAdapter(LkQuantAdapter):
             "w2_qzeros",
             "w13_g_idx_sort_indices",
             "w2_g_idx_sort_indices",
+        )
+        cleanup_only_names = (
             "w13_weight",
             "w2_weight",
         )
 
         device = torch.device(torch.cuda.current_device())
-        for name in param_names:
+        if layer.is_cpu_layer:
+            for name in (*prefill_param_names, *cleanup_only_names):
+                if hasattr(layer, name):
+                    setattr(
+                        layer,
+                        name,
+                        torch.nn.Parameter(
+                            torch.empty(0, device=device), requires_grad=False
+                        ),
+                    )
+            return
+
+        for name in prefill_param_names:
             if not hasattr(layer, name):
                 continue
+            weight = getattr(layer, name)
+            layer.distribute_weight_tensor(name, weight)
             setattr(
                 layer,
                 name,
                 torch.nn.Parameter(torch.empty(0, device=device), requires_grad=False),
             )
+
+        for name in cleanup_only_names:
+            if hasattr(layer, name):
+                setattr(
+                    layer,
+                    name,
+                    torch.nn.Parameter(torch.empty(0, device=device), requires_grad=False),
+                )
