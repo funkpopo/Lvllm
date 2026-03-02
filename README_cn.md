@@ -351,17 +351,21 @@ vllm serve \
 
 | 环境变量 | 类型 | 默认值 | 说明 | 备注 |
 |--------|------|--------|------|------|
-| `LVLLM_MOE_NUMA_ENABLED` | 核心参数 | `0` | 是否启用混合推理: `1`-启用，`0`-禁用 | 设置为`0`禁用混合推理，行为与vLLM相同 |
 | `LK_THREAD_BINDING` | 性能参数 | `CPU_CORE` | 线程绑定策略: `CPU_CORE`-按CPU核心绑定，`NUMA_NODE`-按NUMA节点绑定 | 默认按CPU核心绑定, 遇到性能问题时可尝试按NUMA节点绑定 |
 | `LK_THREADS` | 性能参数 | 自动计算 | 线程数量: 物理核心数-4 | 多GPU多进程时，物理核心数-4除以进程数量 |
 | `OMP_NUM_THREADS` | 性能参数 | 系统逻辑核心数量 | OpenMP线程数: 设置为`LK_THREADS`相同 |   | 
-| `LVLLM_MOE_USE_WEIGHT` | 性能参数 | `TO_DTYPE` | 运行时专家权重格式`TO_DTYPE`: 与config.yaml中dtype一致,bfloat16/float16, `KEEP`: 与模型一致，`INT4`: int4  |
-| `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU预填充参数 | 无 | 常驻GPU的MOE专家层`0`: 第0层，`0-1`: 第0层到第1层，`0,9`: 第0层和第9层 | 留足KV Cache显存后，分配多层可增加性能，并减少对应的内存占用，包含0层才有加速效果 |
-| `LVLLM_GPU_PREFETCH_WINDOW` | GPU预填充参数 | 无 | 预取窗口大小`1`: 预取1层MOE专家 |  一般预取1到2层即可 |
-| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU预填充参数 | 无 | 使用GPU预填充的最小输入长度`4096`：输入长度达到该值后，启动GPU预填充 | 设置值不宜过小，设置为0则关闭GPU预填充功能 |
 | `LK_POWER_SAVING` | cpu节能 | 0 | `1`：启用cpu节能模式，`0`：禁用cpu节能模式 | 建议值：`0` |
-| `LVLLM_ENABLE_NUMA_INTERLEAVE` | 性能参数 | 0 | `0`：快速加载模型，`1`：慢速加载模型可避免OOM | 建议值：加载模型文件时，内存充裕使用`0`，内存紧张使用`1` |
-| `LVLLM_MOE_QUANT_ON_GPU` | 性能参数 | 0 | `0`：不启用GPU专家量化，`1`：启用GPU专家量化 | 显存充足可启用（仅加载时有效，推理时不会额外占用显存），加快模型加载速度 |
+<!-- BEGIN_LVLLM_ENV_TABLE -->
+| `LVLLM_MOE_NUMA_ENABLED` | 核心参数 | `0` | 是否启用混合推理：`1`-启用，`0`-禁用。 | 设置为`0`禁用混合推理，行为与 vLLM 相同。 |
+| `LVLLM_MOE_USE_WEIGHT` | 性能参数 | `INT4` | 运行时专家权重格式：`TO_DTYPE`（模型 dtype）、`KEEP`（保持模型原始格式）、`INT4`/`INT8`（量化权重）。 |  |
+| `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU预填充参数 | `None` | 常驻 GPU 的 MoE 层。示例：`0`、`0-1`、`0,9`。 | 在预留 KV Cache 显存后，增加常驻层可提升性能并降低对应内存压力。 |
+| `LVLLM_GPU_PREFETCH_WINDOW` | GPU预填充参数 | `3` | MoE 专家层预取窗口大小，例如 `1` 表示预取 1 层。 | 通常设置 `1` 到 `2` 即可。 |
+| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU预填充参数 | `0` | 启用 GPU prefill 的最小 token 数。`0` 表示关闭 GPU prefill。 | 应按负载特征配置，设置过小可能影响吞吐。 |
+| `LVLLM_ENABLE_NUMA_INTERLEAVE` | 性能参数 | `0` | `0`：更快加载模型，`1`：更慢加载但可降低 OOM 风险。 | 内存充足建议 `0`，内存紧张建议 `1`。 |
+| `LVLLM_NUMA_BIND_STRATEGY` | 性能参数 | `gpu_local` | Worker 进程 NUMA 绑定策略：`gpu_local` 或 `interleave`。 |  |
+| `LVLLM_NUMACTL_ARGS_OVERRIDE` | 性能参数 | `None` | 显式 `numactl` 参数覆盖，例如 `--cpunodebind=0 --membind=0`。 |  |
+| `LVLLM_MOE_QUANT_ON_GPU` | 性能参数 | `0` | `0`：CPU 侧量化，`1`：加载时使用 GPU 侧量化。 | 显存充足时可启用，仅在模型加载阶段生效。 |
+<!-- END_LVLLM_ENV_TABLE -->
 
  
 | 参数 | 示例值 | 说明 |

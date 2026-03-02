@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -117,6 +120,98 @@ def test_lk_moe_gpu_resident_layer_idx_disabled_feature(
 
     # Feature disabled means all layers stay on GPU by default.
     assert envs.is_lk_moe_gpu_resident_layer_idx(123)
+
+
+def test_validate_lvllm_config_contract_defaults(monkeypatch: pytest.MonkeyPatch):
+    disable_envs_cache()
+    for name in (
+        "LVLLM_MOE_NUMA_ENABLED",
+        "LVLLM_ENABLE_NUMA_INTERLEAVE",
+        "LVLLM_NUMA_BIND_STRATEGY",
+        "LVLLM_NUMACTL_ARGS_OVERRIDE",
+        "LVLLM_MOE_QUANT_ON_GPU",
+        "LVLLM_MOE_USE_WEIGHT",
+        "LVLLM_GPU_RESIDENT_MOE_LAYERS",
+        "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE",
+        "LVLLM_GPU_PREFETCH_WINDOW",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    snapshot = envs.validate_lvllm_config_contract(hard_fail=True, log_snapshot=False)
+    assert snapshot["LVLLM_MOE_USE_WEIGHT"] == "INT4"
+    assert snapshot["LVLLM_GPU_PREFETCH_WINDOW"] == 3
+    assert snapshot["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"] == 0
+    assert snapshot["LVLLM_GPU_PREFILL_ENABLED"] is False
+
+
+def test_validate_lvllm_config_contract_rejects_invalid_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    disable_envs_cache()
+    monkeypatch.setenv("LVLLM_MOE_USE_WEIGHT", "INVALID")
+    with pytest.raises(ValueError, match="Invalid value 'INVALID' for LVLLM_MOE_USE_WEIGHT"):
+        envs.validate_lvllm_config_contract(hard_fail=True, log_snapshot=False)
+
+
+def test_validate_lvllm_config_contract_rejects_prefetch_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    disable_envs_cache()
+    monkeypatch.setenv("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE", "2048")
+    monkeypatch.setenv("LVLLM_GPU_PREFETCH_WINDOW", "0")
+    with pytest.raises(
+        ValueError,
+        match="LVLLM_GPU_PREFETCH_WINDOW must be > 0 when LVLLM_GPU_PREFILL_MIN_BATCH_SIZE > 0",
+    ):
+        envs.validate_lvllm_config_contract(hard_fail=True, log_snapshot=False)
+
+
+def test_validate_lvllm_config_contract_requires_moe_enabled_for_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    disable_envs_cache()
+    monkeypatch.setenv("LVLLM_MOE_NUMA_ENABLED", "0")
+    monkeypatch.setenv("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE", "2048")
+    monkeypatch.setenv("LVLLM_GPU_PREFETCH_WINDOW", "1")
+    with pytest.raises(
+        ValueError,
+        match="LVLLM_GPU_PREFILL_MIN_BATCH_SIZE > 0 requires LVLLM_MOE_NUMA_ENABLED=1",
+    ):
+        envs.validate_lvllm_config_contract(hard_fail=True, log_snapshot=False)
+
+
+def test_validate_lvllm_config_contract_rejects_invalid_resident_layers(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    disable_envs_cache()
+    monkeypatch.setenv("LVLLM_GPU_RESIDENT_MOE_LAYERS", "0-2,bad")
+    with pytest.raises(ValueError, match="Invalid LVLLM_GPU_RESIDENT_MOE_LAYERS segments"):
+        envs.validate_lvllm_config_contract(hard_fail=True, log_snapshot=False)
+
+
+def test_validate_lvllm_config_contract_requires_interleave_for_numactl_override(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    disable_envs_cache()
+    monkeypatch.setenv("LVLLM_ENABLE_NUMA_INTERLEAVE", "0")
+    monkeypatch.setenv("LVLLM_NUMACTL_ARGS_OVERRIDE", "--interleave=all")
+    with pytest.raises(
+        ValueError,
+        match="LVLLM_NUMACTL_ARGS_OVERRIDE requires LVLLM_ENABLE_NUMA_INTERLEAVE=1",
+    ):
+        envs.validate_lvllm_config_contract(hard_fail=True, log_snapshot=False)
+
+
+def test_lvllm_readme_env_table_is_synced():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "sync_lvllm_readme_env_table.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--check"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 class TestEnvWithChoices:

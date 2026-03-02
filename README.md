@@ -350,16 +350,20 @@ vllm serve \
 
 | Environment Variable | Type | Default Value | Description | Notes |
 |--------|------|--------|------|------|
-| `LVLLM_MOE_NUMA_ENABLED` | Core Parameter | `0` | Whether to enable hybrid inference: `1`-enabled, `0`-disabled | Set to `0` to disable hybrid inference, behavior is the same as vLLM |
 | `LK_THREAD_BINDING` | Performance Parameter | `CPU_CORE` | Thread binding policy: `CPU_CORE` - bind by CPU core, `NUMA_NODE` - bind by NUMA node | Default is binding by CPU core, when encountering performance issues, you can try binding by NUMA node |
 | `LK_THREADS` | Performance Parameter | Auto-calculated | Number of threads: physical cores - 4 | For multi-GPU multi-process, (physical cores - 4) divided by number of processes |
 | `OMP_NUM_THREADS` | Performance Parameter | System logical core count | OpenMP thread count: set to same as `LK_THREADS` | |
-| `LVLLM_MOE_USE_WEIGHT` | Performance Parameter | `TO_DTYPE` | Runtime expert weight format `TO_DTYPE`: same as dtype in config.yaml, bfloat16/float16, `KEEP`: same as model, `INT4`: int4 |
-| `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU Prefill Parameter | None | MOE expert layers resident on GPU `0`: layer 0, `0-1`: layers 0 to 1, `0,9`: layers 0 and 9 | After reserving sufficient KV Cache VRAM, allocating multiple layers can increase performance and reduce corresponding memory usage, including layer 0 to achieve acceleration effect |
-| `LVLLM_GPU_PREFETCH_WINDOW` | GPU Prefill Parameter | None | Prefetch window size `1`: prefetch 1 layer of MOE experts | Generally, prefetching 1 to 2 layers is sufficient |
-| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU Prefill Parameter | None | Minimum input length for using GPU prefill `4096`: when input length reaches this value, start GPU prefill | The value should not be too small, set to 0 to disable GPU prefill function |
-| `LVLLM_ENABLE_NUMA_INTERLEAVE` | Performance Parameter | 0 | `0`：load model quickly, `1`：load model slowly to avoid OOM | Suggested value: use `0` when memory is abundant, use `1` when memory is tight |
-| `LVLLM_MOE_QUANT_ON_GPU` | Performance Parameter | 0 | `0`：enable CPU expert quantization, `1`：enable GPU expert quantization | enable if GPU memory is abundant (only effective at loading time, inference will not occupy extra GPU memory)，accelerate model loading speed |
+<!-- BEGIN_LVLLM_ENV_TABLE -->
+| `LVLLM_MOE_NUMA_ENABLED` | Core Parameter | `0` | Whether to enable hybrid inference: `1`-enabled, `0`-disabled. | Set to `0` to disable hybrid inference; behavior is the same as vLLM. |
+| `LVLLM_MOE_USE_WEIGHT` | Performance Parameter | `INT4` | Runtime expert weight format: `TO_DTYPE` (model dtype), `KEEP` (original model weight format), `INT4`/`INT8` (quantized). |  |
+| `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU Prefill Parameter | `None` | MoE layers resident on GPU. Examples: `0`, `0-1`, `0,9`. | After reserving KV cache memory, more resident layers can improve performance and reduce CPU memory pressure. |
+| `LVLLM_GPU_PREFETCH_WINDOW` | GPU Prefill Parameter | `3` | Prefetch window size for MoE expert layers, e.g. `1` means prefetch 1 layer. | In most cases, `1` to `2` is enough. |
+| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU Prefill Parameter | `0` | Minimum token count to enable GPU prefill. `0` disables GPU prefill. | Set this based on workload characteristics; too small can hurt throughput. |
+| `LVLLM_ENABLE_NUMA_INTERLEAVE` | Performance Parameter | `0` | `0`: faster model load, `1`: slower load with lower OOM risk. | Use `0` when memory is sufficient; use `1` when memory is tight. |
+| `LVLLM_NUMA_BIND_STRATEGY` | Performance Parameter | `gpu_local` | NUMA binding strategy for worker processes: `gpu_local` or `interleave`. |  |
+| `LVLLM_NUMACTL_ARGS_OVERRIDE` | Performance Parameter | `None` | Explicit `numactl` arguments override, e.g. `--cpunodebind=0 --membind=0`. |  |
+| `LVLLM_MOE_QUANT_ON_GPU` | Performance Parameter | `0` | `0`: CPU-side quantization, `1`: GPU-side quantization at load time. | Enable when GPU memory is sufficient; only affects model loading stage. |
+<!-- END_LVLLM_ENV_TABLE -->
 
 
 

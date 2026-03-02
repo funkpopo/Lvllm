@@ -9,6 +9,8 @@ import sys
 import tempfile
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
@@ -221,7 +223,7 @@ if TYPE_CHECKING:
     LVLLM_NUMA_BIND_STRATEGY: Literal["gpu_local", "interleave"] = "gpu_local"
     LVLLM_NUMACTL_ARGS_OVERRIDE: str | None = None
     LVLLM_MOE_QUANT_ON_GPU: bool = False
-    LVLLM_MOE_USE_WEIGHT: Literal["KEEP", "TO_DTYPE", "INT4"] = "INT4"
+    LVLLM_MOE_USE_WEIGHT: Literal["KEEP", "TO_DTYPE", "INT4", "INT8"] = "INT4"
     LVLLM_GPU_RESIDENT_MOE_LAYERS: str | None = None
     LVLLM_GPU_PREFILL_MIN_BATCH_SIZE: int = 0
     LVLLM_GPU_PREFETCH_WINDOW: int = 3
@@ -464,6 +466,160 @@ def get_env_or_set_default(
         return default_value
 
     return _get_or_set_default
+
+
+def _bool_to_env(value: bool) -> str:
+    return "1" if value else "0"
+
+
+LVLLM_MOE_NUMA_ENABLED_DEFAULT = False
+LVLLM_ENABLE_NUMA_INTERLEAVE_DEFAULT = False
+LVLLM_NUMA_BIND_STRATEGY_DEFAULT = "gpu_local"
+LVLLM_MOE_QUANT_ON_GPU_DEFAULT = False
+LVLLM_MOE_USE_WEIGHT_DEFAULT = "INT4"
+LVLLM_MOE_USE_WEIGHT_CHOICES = ("KEEP", "TO_DTYPE", "INT4", "INT8")
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE_DEFAULT = 0
+LVLLM_GPU_PREFETCH_WINDOW_DEFAULT = 3
+
+
+class MoeComputeStrategy(str, Enum):
+    TO_DTYPE = "TO_DTYPE"
+    KEEP = "KEEP"
+    INT8 = "INT8"
+    INT4 = "INT4"
+
+
+@dataclass(frozen=True)
+class LvllmEnvDocRow:
+    name: str
+    category_en: str
+    category_zh: str
+    default: str
+    description_en: str
+    description_zh: str
+    notes_en: str = ""
+    notes_zh: str = ""
+
+
+LVLLM_README_DOC_ROWS: tuple[LvllmEnvDocRow, ...] = (
+    LvllmEnvDocRow(
+        name="LVLLM_MOE_NUMA_ENABLED",
+        category_en="Core Parameter",
+        category_zh="核心参数",
+        default=_bool_to_env(LVLLM_MOE_NUMA_ENABLED_DEFAULT),
+        description_en=(
+            "Whether to enable hybrid inference: `1`-enabled, `0`-disabled."
+        ),
+        description_zh="是否启用混合推理：`1`-启用，`0`-禁用。",
+        notes_en="Set to `0` to disable hybrid inference; behavior is the same as vLLM.",
+        notes_zh="设置为`0`禁用混合推理，行为与 vLLM 相同。",
+    ),
+    LvllmEnvDocRow(
+        name="LVLLM_MOE_USE_WEIGHT",
+        category_en="Performance Parameter",
+        category_zh="性能参数",
+        default=LVLLM_MOE_USE_WEIGHT_DEFAULT,
+        description_en=(
+            "Runtime expert weight format: `TO_DTYPE` (model dtype), "
+            "`KEEP` (original model weight format), `INT4`/`INT8` (quantized)."
+        ),
+        description_zh=(
+            "运行时专家权重格式：`TO_DTYPE`（模型 dtype）、"
+            "`KEEP`（保持模型原始格式）、`INT4`/`INT8`（量化权重）。"
+        ),
+    ),
+    LvllmEnvDocRow(
+        name="LVLLM_GPU_RESIDENT_MOE_LAYERS",
+        category_en="GPU Prefill Parameter",
+        category_zh="GPU预填充参数",
+        default="None",
+        description_en=(
+            "MoE layers resident on GPU. Examples: `0`, `0-1`, `0,9`."
+        ),
+        description_zh=(
+            "常驻 GPU 的 MoE 层。示例：`0`、`0-1`、`0,9`。"
+        ),
+        notes_en=(
+            "After reserving KV cache memory, more resident layers can improve "
+            "performance and reduce CPU memory pressure."
+        ),
+        notes_zh="在预留 KV Cache 显存后，增加常驻层可提升性能并降低对应内存压力。",
+    ),
+    LvllmEnvDocRow(
+        name="LVLLM_GPU_PREFETCH_WINDOW",
+        category_en="GPU Prefill Parameter",
+        category_zh="GPU预填充参数",
+        default=str(LVLLM_GPU_PREFETCH_WINDOW_DEFAULT),
+        description_en=(
+            "Prefetch window size for MoE expert layers, e.g. `1` means prefetch 1 layer."
+        ),
+        description_zh="MoE 专家层预取窗口大小，例如 `1` 表示预取 1 层。",
+        notes_en="In most cases, `1` to `2` is enough.",
+        notes_zh="通常设置 `1` 到 `2` 即可。",
+    ),
+    LvllmEnvDocRow(
+        name="LVLLM_GPU_PREFILL_MIN_BATCH_SIZE",
+        category_en="GPU Prefill Parameter",
+        category_zh="GPU预填充参数",
+        default=str(LVLLM_GPU_PREFILL_MIN_BATCH_SIZE_DEFAULT),
+        description_en=(
+            "Minimum token count to enable GPU prefill. `0` disables GPU prefill."
+        ),
+        description_zh="启用 GPU prefill 的最小 token 数。`0` 表示关闭 GPU prefill。",
+        notes_en="Set this based on workload characteristics; too small can hurt throughput.",
+        notes_zh="应按负载特征配置，设置过小可能影响吞吐。",
+    ),
+    LvllmEnvDocRow(
+        name="LVLLM_ENABLE_NUMA_INTERLEAVE",
+        category_en="Performance Parameter",
+        category_zh="性能参数",
+        default=_bool_to_env(LVLLM_ENABLE_NUMA_INTERLEAVE_DEFAULT),
+        description_en="`0`: faster model load, `1`: slower load with lower OOM risk.",
+        description_zh="`0`：更快加载模型，`1`：更慢加载但可降低 OOM 风险。",
+        notes_en="Use `0` when memory is sufficient; use `1` when memory is tight.",
+        notes_zh="内存充足建议 `0`，内存紧张建议 `1`。",
+    ),
+    LvllmEnvDocRow(
+        name="LVLLM_NUMA_BIND_STRATEGY",
+        category_en="Performance Parameter",
+        category_zh="性能参数",
+        default=LVLLM_NUMA_BIND_STRATEGY_DEFAULT,
+        description_en=(
+            "NUMA binding strategy for worker processes: `gpu_local` or `interleave`."
+        ),
+        description_zh="Worker 进程 NUMA 绑定策略：`gpu_local` 或 `interleave`。",
+    ),
+    LvllmEnvDocRow(
+        name="LVLLM_NUMACTL_ARGS_OVERRIDE",
+        category_en="Performance Parameter",
+        category_zh="性能参数",
+        default="None",
+        description_en=(
+            "Explicit `numactl` arguments override, e.g. "
+            "`--cpunodebind=0 --membind=0`."
+        ),
+        description_zh=(
+            "显式 `numactl` 参数覆盖，例如 `--cpunodebind=0 --membind=0`。"
+        ),
+    ),
+    LvllmEnvDocRow(
+        name="LVLLM_MOE_QUANT_ON_GPU",
+        category_en="Performance Parameter",
+        category_zh="性能参数",
+        default=_bool_to_env(LVLLM_MOE_QUANT_ON_GPU_DEFAULT),
+        description_en="`0`: CPU-side quantization, `1`: GPU-side quantization at load time.",
+        description_zh="`0`：CPU 侧量化，`1`：加载时使用 GPU 侧量化。",
+        notes_en=(
+            "Enable when GPU memory is sufficient; only affects model loading stage."
+        ),
+        notes_zh="显存充足时可启用，仅在模型加载阶段生效。",
+    ),
+)
+
+
+LVLLM_README_TABLE_ORDER: tuple[str, ...] = tuple(
+    row.name for row in LVLLM_README_DOC_ROWS
+)
 
 
 # The start-* and end* here are used by the documentation generator
@@ -1555,16 +1711,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEBUG_WORKSPACE": lambda: bool(int(os.getenv("VLLM_DEBUG_WORKSPACE", "0"))),
     
     # Whether to enable NUMA for MOE.
-    "LVLLM_MOE_NUMA_ENABLED":
-    lambda: bool(int(os.getenv("LVLLM_MOE_NUMA_ENABLED", "0"))),
+    "LVLLM_MOE_NUMA_ENABLED": lambda: bool(
+        int(
+            os.getenv(
+                "LVLLM_MOE_NUMA_ENABLED",
+                _bool_to_env(LVLLM_MOE_NUMA_ENABLED_DEFAULT),
+            )
+        )
+    ),
     # Whether to enable NUMA interleaving for multiprocessing.
     "LVLLM_ENABLE_NUMA_INTERLEAVE": lambda: bool(
-        int(os.getenv("LVLLM_ENABLE_NUMA_INTERLEAVE", "0"))
+        int(
+            os.getenv(
+                "LVLLM_ENABLE_NUMA_INTERLEAVE",
+                _bool_to_env(LVLLM_ENABLE_NUMA_INTERLEAVE_DEFAULT),
+            )
+        )
     ),
     # NUMA binding strategy for multiprocessing workers.
     "LVLLM_NUMA_BIND_STRATEGY": env_with_choices(
         "LVLLM_NUMA_BIND_STRATEGY",
-        "gpu_local",
+        LVLLM_NUMA_BIND_STRATEGY_DEFAULT,
         ["gpu_local", "interleave"],
         case_sensitive=False,
     ),
@@ -1574,18 +1741,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "LVLLM_NUMACTL_ARGS_OVERRIDE", None
     ),
     "LVLLM_MOE_QUANT_ON_GPU": lambda: bool(
-        int(os.getenv("LVLLM_MOE_QUANT_ON_GPU", "0"))
+        int(
+            os.getenv(
+                "LVLLM_MOE_QUANT_ON_GPU", _bool_to_env(LVLLM_MOE_QUANT_ON_GPU_DEFAULT)
+            )
+        )
     ),
     # Weight format for MOE.
-    "LVLLM_MOE_USE_WEIGHT": lambda: os.getenv("LVLLM_MOE_USE_WEIGHT", "INT4"),
-    "LVLLM_GPU_RESIDENT_MOE_LAYERS": lambda: os.environ.get("LVLLM_GPU_RESIDENT_MOE_LAYERS", None),
+    "LVLLM_MOE_USE_WEIGHT": env_with_choices(
+        "LVLLM_MOE_USE_WEIGHT",
+        LVLLM_MOE_USE_WEIGHT_DEFAULT,
+        list(LVLLM_MOE_USE_WEIGHT_CHOICES),
+        case_sensitive=False,
+    ),
+    "LVLLM_GPU_RESIDENT_MOE_LAYERS": lambda: os.environ.get(
+        "LVLLM_GPU_RESIDENT_MOE_LAYERS", None
+    ),
     # Whether to enable GPU expert computation.
     "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE": lambda: int(
-        os.getenv("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE", "0")
+        os.getenv(
+            "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE",
+            str(LVLLM_GPU_PREFILL_MIN_BATCH_SIZE_DEFAULT),
+        )
     ),
     # Prefetch window size for GPU expert computation.
     "LVLLM_GPU_PREFETCH_WINDOW": lambda: int(
-        os.getenv("LVLLM_GPU_PREFETCH_WINDOW", "3")
+        os.getenv("LVLLM_GPU_PREFETCH_WINDOW", str(LVLLM_GPU_PREFETCH_WINDOW_DEFAULT))
     ),
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
@@ -1705,11 +1886,15 @@ def is_set(name: str):
 
 def validate_environ(hard_fail: bool) -> None:
     for env in os.environ:
-        if env.startswith("VLLM_") and env not in environment_variables:
+        if env.startswith(("VLLM_", "LVLLM_")) and env not in environment_variables:
             if hard_fail:
-                raise ValueError(f"Unknown vLLM environment variable detected: {env}")
+                raise ValueError(
+                    f"Unknown vLLM/LVLLM environment variable detected: {env}"
+                )
             else:
-                logger.warning("Unknown vLLM environment variable detected: %s", env)
+                logger.warning(
+                    "Unknown vLLM/LVLLM environment variable detected: %s", env
+                )
 
 
 def compile_factors() -> dict[str, object]:
@@ -1833,21 +2018,193 @@ def compile_factors() -> dict[str, object]:
         factors[var] = normalize_value(os.getenv(var))
 
     return factors
- 
-from enum import Enum
-class MoeComputeStrategy(str, Enum): 
-        TO_DTYPE = "TO_DTYPE"      
-        KEEP = "KEEP"              
-        INT8 = "INT8"             
-        INT4 = "INT4" 
-        
+
+_is_in_profile_run = True
+_lvllm_snapshot_logged = False
+
+
+def _parse_lk_moe_gpu_resident_layer_plan(
+    value: str | None, *, strict: bool
+) -> frozenset[int]:
+    if value is None:
+        return frozenset()
+
+    raw_value = value.strip()
+    if not raw_value:
+        return frozenset()
+
+    layer_ids: set[int] = set()
+    invalid_parts: list[str] = []
+    for part in raw_value.split(","):
+        token = part.strip()
+        if not token:
+            continue
+
+        if "-" in token:
+            bounds = [bound.strip() for bound in token.split("-")]
+            if len(bounds) != 2 or not all(bound.isdigit() for bound in bounds):
+                invalid_parts.append(token)
+                continue
+
+            start, end = map(int, bounds)
+            if start > end:
+                invalid_parts.append(token)
+                continue
+
+            layer_ids.update(range(start, end + 1))
+            continue
+
+        if not token.isdigit():
+            invalid_parts.append(token)
+            continue
+
+        layer_ids.add(int(token))
+
+    if invalid_parts and strict:
+        raise ValueError(
+            "Invalid LVLLM_GPU_RESIDENT_MOE_LAYERS segments: "
+            f"{', '.join(sorted(set(invalid_parts)))}. "
+            "Expected comma separated integers or ranges, e.g. '0,2-4'."
+        )
+
+    return frozenset(layer_ids)
+
+
+def get_lk_moe_gpu_resident_layer_plan(*, strict: bool = False) -> frozenset[int]:
+    raw_value = environment_variables["LVLLM_GPU_RESIDENT_MOE_LAYERS"]()
+    return _parse_lk_moe_gpu_resident_layer_plan(raw_value, strict=strict)
+
+
+def is_lk_moe_gpu_resident_layer_idx(layer_idx: int) -> bool:
+    if not is_lk_moe_feature_enabled():
+        return True
+    return layer_idx in get_lk_moe_gpu_resident_layer_plan(strict=False)
+
+
+def get_gpu_prefill_min_batch_size() -> int:
+    return environment_variables["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"]()
+
+
+def get_gpu_prefetch_window() -> int:
+    return environment_variables["LVLLM_GPU_PREFETCH_WINDOW"]()
+
+
+def get_moe_compute_strategy() -> MoeComputeStrategy:
+    value = str(environment_variables["LVLLM_MOE_USE_WEIGHT"]()).upper()
+    return MoeComputeStrategy(value)
+
+
+def get_lvllm_config_snapshot(*, strict: bool = True) -> dict[str, Any]:
+    resident_layers = sorted(get_lk_moe_gpu_resident_layer_plan(strict=strict))
+    prefill_min_batch_size = get_gpu_prefill_min_batch_size()
+
+    return {
+        "LVLLM_MOE_NUMA_ENABLED": bool(
+            environment_variables["LVLLM_MOE_NUMA_ENABLED"]()
+        ),
+        "LVLLM_ENABLE_NUMA_INTERLEAVE": bool(
+            environment_variables["LVLLM_ENABLE_NUMA_INTERLEAVE"]()
+        ),
+        "LVLLM_NUMA_BIND_STRATEGY": get_numa_bind_strategy(),
+        "LVLLM_NUMACTL_ARGS_OVERRIDE": get_numa_numactl_args_override(),
+        "LVLLM_MOE_QUANT_ON_GPU": is_lk_moe_quant_on_gpu(),
+        "LVLLM_MOE_USE_WEIGHT": get_moe_compute_strategy().value,
+        "LVLLM_GPU_RESIDENT_MOE_LAYERS": environment_variables[
+            "LVLLM_GPU_RESIDENT_MOE_LAYERS"
+        ](),
+        "LVLLM_GPU_RESIDENT_LAYER_PLAN": resident_layers,
+        "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE": prefill_min_batch_size,
+        "LVLLM_GPU_PREFETCH_WINDOW": get_gpu_prefetch_window(),
+        "LVLLM_GPU_PREFILL_ENABLED": prefill_min_batch_size > 0,
+    }
+
+
+def validate_lvllm_config_contract(
+    hard_fail: bool = True, *, log_snapshot: bool = True
+) -> dict[str, Any]:
+    snapshot = get_lvllm_config_snapshot(strict=True)
+    errors: list[str] = []
+
+    prefill_min_batch_size = snapshot["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"]
+    prefetch_window = snapshot["LVLLM_GPU_PREFETCH_WINDOW"]
+
+    if prefill_min_batch_size < 0:
+        errors.append(
+            "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE must be >= 0, "
+            f"got {prefill_min_batch_size}."
+        )
+
+    if prefetch_window < 0:
+        errors.append(
+            f"LVLLM_GPU_PREFETCH_WINDOW must be >= 0, got {prefetch_window}."
+        )
+
+    if prefill_min_batch_size > 0 and prefetch_window <= 0:
+        errors.append(
+            "LVLLM_GPU_PREFETCH_WINDOW must be > 0 when "
+            "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE > 0."
+        )
+
+    if not snapshot["LVLLM_MOE_NUMA_ENABLED"]:
+        if prefill_min_batch_size > 0:
+            errors.append(
+                "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE > 0 requires "
+                "LVLLM_MOE_NUMA_ENABLED=1."
+            )
+        if snapshot["LVLLM_MOE_QUANT_ON_GPU"]:
+            errors.append(
+                "LVLLM_MOE_QUANT_ON_GPU=1 requires LVLLM_MOE_NUMA_ENABLED=1."
+            )
+        if snapshot["LVLLM_GPU_RESIDENT_LAYER_PLAN"]:
+            errors.append(
+                "LVLLM_GPU_RESIDENT_MOE_LAYERS requires LVLLM_MOE_NUMA_ENABLED=1."
+            )
+
+    if snapshot["LVLLM_NUMACTL_ARGS_OVERRIDE"] and not snapshot[
+        "LVLLM_ENABLE_NUMA_INTERLEAVE"
+    ]:
+        errors.append(
+            "LVLLM_NUMACTL_ARGS_OVERRIDE requires LVLLM_ENABLE_NUMA_INTERLEAVE=1."
+        )
+
+    if (
+        snapshot["LVLLM_NUMA_BIND_STRATEGY"] == "interleave"
+        and not snapshot["LVLLM_ENABLE_NUMA_INTERLEAVE"]
+    ):
+        errors.append(
+            "LVLLM_NUMA_BIND_STRATEGY=interleave requires "
+            "LVLLM_ENABLE_NUMA_INTERLEAVE=1."
+        )
+
+    if errors:
+        error_message = "Invalid LVLLM configuration:\n- " + "\n- ".join(errors)
+        if hard_fail:
+            snapshot_json = json.dumps(snapshot, sort_keys=True)
+            raise ValueError(f"{error_message}\nEffective LVLLM snapshot: {snapshot_json}")
+        logger.warning("%s", error_message)
+
+    global _lvllm_snapshot_logged
+    if log_snapshot and not _lvllm_snapshot_logged:
+        logger.info(
+            "Effective LVLLM config snapshot: %s",
+            json.dumps(snapshot, sort_keys=True),
+        )
+        _lvllm_snapshot_logged = True
+
+    return snapshot
+
+
 def is_lk_moe_feature_enabled() -> bool:
     try:
-        import  lk_moe  
-        return environment_variables["LVLLM_MOE_NUMA_ENABLED"]()
-    except Exception as e:
-        print(f"Error: lk_moe is not available falling back to default behavior." , e)
+        import lk_moe  # noqa: F401
+    except Exception as exc:
+        logger.debug(
+            "lk_moe is unavailable; disable LVLLM hybrid MoE path. reason=%s", exc
+        )
         return False
+
+    return environment_variables["LVLLM_MOE_NUMA_ENABLED"]()
+
 
 def is_numa_interleave_enabled() -> bool:
     return environment_variables["LVLLM_ENABLE_NUMA_INTERLEAVE"]()
@@ -1856,7 +2213,7 @@ def is_numa_interleave_enabled() -> bool:
 def get_numa_bind_strategy() -> str:
     strategy = environment_variables["LVLLM_NUMA_BIND_STRATEGY"]()
     if strategy is None:
-        return "gpu_local"
+        return LVLLM_NUMA_BIND_STRATEGY_DEFAULT
     return str(strategy).strip().lower()
 
 
@@ -1871,40 +2228,30 @@ def get_numa_numactl_args_override() -> str | None:
 def is_lk_moe_quant_on_gpu() -> bool:
     return environment_variables["LVLLM_MOE_QUANT_ON_GPU"]()
 
+
 def is_lk_moe_use_gpu_prefill() -> bool:
-    return environment_variables["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"]() > 0
+    return get_gpu_prefill_min_batch_size() > 0
+
 
 def disable_lk_moe_gpu_prefill() -> int:
-    origin_value = environment_variables["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"]()
+    origin_value = get_gpu_prefill_min_batch_size()
     environment_variables["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"] = lambda: 0
     return origin_value
+
 
 def enable_lk_moe_gpu_prefill(value: int) -> int:
     environment_variables["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"] = lambda: value
     return value
 
-_is_in_profile_run = True
 
-def is_in_profile_run(): 
+def is_in_profile_run() -> bool:
     return _is_in_profile_run
 
-def set_profile_run(status: bool): 
+
+def set_profile_run(status: bool) -> None:
     global _is_in_profile_run
     _is_in_profile_run = status
-    
-def get_gpu_prefill_min_batch_size() -> int:
-    return environment_variables["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"]() 
-def get_moe_compute_strategy() -> MoeComputeStrategy: 
-    strategy = environment_variables["LVLLM_MOE_USE_WEIGHT"]()
-    
-    try:
-        return MoeComputeStrategy(strategy.upper())
-    except ValueError: 
-        print(f"Warning: Invalid LVLLM_MOE_USE_WEIGHT value '{strategy}', using 'INT4'")
-        return MoeComputeStrategy.INT4   
 
-def get_gpu_prefetch_window() -> int:
-    return environment_variables["LVLLM_GPU_PREFETCH_WINDOW"]()
 
 def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
     """
@@ -1928,56 +2275,30 @@ def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
         )
 
         return int_vals[0]
-    else:
-        assert len(int_vals) <= 2, (
-            f"layer name {layer_name} should contain most two integers"
-        )
-        layer_index = (
-            int_vals[0] * num_attn_module + int_vals[1]
-            if len(int_vals) == 2
-            else int_vals[0]
-        )
-        return layer_index
+
+    assert len(int_vals) <= 2, (
+        f"layer name {layer_name} should contain most two integers"
+    )
+    layer_index = (
+        int_vals[0] * num_attn_module + int_vals[1]
+        if len(int_vals) == 2
+        else int_vals[0]
+    )
+    return layer_index
+
 
 def is_lk_moe_gpu_prefill_layer(layer_name: str) -> bool:
     return is_lk_moe_use_gpu_prefill() and not is_lk_moe_gpu_resident_layer(layer_name)
-    
-def is_lk_moe_cpu_layer(layer_name: str)-> bool:
 
-    return is_lk_moe_feature_enabled() and not is_lk_moe_gpu_resident_layer(layer_name) and not is_lk_moe_gpu_prefill_layer(layer_name)
-    
+
+def is_lk_moe_cpu_layer(layer_name: str) -> bool:
+    return (
+        is_lk_moe_feature_enabled()
+        and not is_lk_moe_gpu_resident_layer(layer_name)
+        and not is_lk_moe_gpu_prefill_layer(layer_name)
+    )
+
+
 def is_lk_moe_gpu_resident_layer(layer_name: str) -> bool:
-    
-    if not is_lk_moe_feature_enabled():
-        return True
-    
     layer_id = extract_layer_index(layer_name)
-    
-  
-    disabled_layers_env = environment_variables.get("LVLLM_GPU_RESIDENT_MOE_LAYERS", "")()
-    if not disabled_layers_env:
-        return False   
-    
-    disabled_layers_env = disabled_layers_env.strip()
-    
-    disabled_layers = set()
-    for part in disabled_layers_env.split(','):
-        part = part.strip()
-        if not part:
-            continue
-        
-        if '-' in part:
-            try:
-                start, end = map(int, part.split('-')) 
-                if start <= end:
-                    disabled_layers.update(range(start, end + 1))
-            except ValueError: 
-                continue
-        else:
-            try:
-                disabled_layers.add(int(part))
-            except ValueError: 
-                continue
-     
-    return layer_id in disabled_layers
- 
+    return is_lk_moe_gpu_resident_layer_idx(layer_id)
