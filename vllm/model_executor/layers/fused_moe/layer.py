@@ -425,6 +425,8 @@ class FusedMoE(CustomOp):
         self.is_gpu_resident_layer = is_lk_moe_gpu_resident_layer(self.layer_name) 
         self.is_gpu_prefill_layer = is_lk_moe_gpu_prefill_layer(self.layer_name)
         self.is_cpu_layer = is_lk_moe_cpu_layer(self.layer_name)
+        self.lk_moe = None
+        self.lk_moe_config = None
         if get_gpu_prefill_min_batch_size() > vllm_config.scheduler_config.max_num_batched_tokens:
             logger.error(
                 f"gpu_prefill_min_batch_size ({get_gpu_prefill_min_batch_size()}) "
@@ -1609,12 +1611,80 @@ class FusedMoE(CustomOp):
         forward_context = get_forward_context()
         if (hasattr(forward_context, 'cudagraph_runtime_mode') and 
             forward_context.cudagraph_runtime_mode != CUDAGraphMode.NONE):
-            return 
+            return False
         return (not torch.cuda.is_current_stream_capturing() and 
                 self.is_gpu_prefill_layer and 
                 hidden_states.size(0) >= get_gpu_prefill_min_batch_size())
-                
-            
+    
+    def _lk_cpu_supported_quant_method_types(self):
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Fp8MoEMethod
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MarlinMoEMethod
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MoEMethod
+        from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+        from vllm.model_executor.layers.quantization.gguf import GGUFMoEMethod
+        return (
+            UnquantizedFusedMoEMethod,
+            Fp8MoEMethod,
+            GGUFMoEMethod,
+            CompressedTensorsW8A8Fp8MoEMethod,
+            CompressedTensorsWNA16MarlinMoEMethod,
+            CompressedTensorsWNA16MoEMethod,
+        )
+
+    def _lk_gpu_prefill_supported_quant_method_types(self):
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Fp8MoEMethod
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MarlinMoEMethod
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MoEMethod
+        from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+        return (
+            UnquantizedFusedMoEMethod,
+            Fp8MoEMethod,
+            CompressedTensorsW8A8Fp8MoEMethod,
+            CompressedTensorsWNA16MarlinMoEMethod,
+            CompressedTensorsWNA16MoEMethod,
+        )
+
+    def supports_lk_cpu_quant_method(self) -> bool:
+        return isinstance(self.quant_method, self._lk_cpu_supported_quant_method_types())
+
+    def supports_lk_cpu_path(self) -> bool:
+        return self.supports_lk_cpu_quant_method() and self.lk_moe is not None
+
+    def supports_lk_gpu_prefill_quant_method(self) -> bool:
+        return isinstance(self.quant_method, self._lk_gpu_prefill_supported_quant_method_types())
+
+    def supports_lk_gpu_prefill(self) -> bool:
+        return self.supports_lk_gpu_prefill_quant_method() and self.lk_moe is not None
+
+    def _lk_vllm_fallback_quant_method_types(self):
+        # These quant methods already have stable vLLM MoE kernels.
+        # When LK path is unavailable, we can safely use quant_method.apply*.
+        from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinMoEMethod
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Fp8MoEMethod
+        from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+        return (
+            AWQMarlinMoEMethod,
+            Fp8MoEMethod,
+            CompressedTensorsW8A8Fp8MoEMethod,
+        )
+
+    def supports_vllm_quant_fallback(self) -> bool:
+        return isinstance(self.quant_method, self._lk_vllm_fallback_quant_method_types())
+
+    def disable_lk_paths(self, reason: str) -> None:
+        self.lk_moe = None
+        self.lk_moe_config = None
+        # Keep behavior predictable: if LK CPU path is disabled for this layer,
+        # also disable LK prefill to avoid prefetch-time hard failures.
+        self.is_gpu_prefill_layer = False
+        logger.warning_once(
+            "Disable LK paths for layer=%s quant_method=%s. Reason: %s",
+            self.layer_name,
+            type(self.quant_method).__name__,
+            reason,
+        )
+             
+             
     def _get_ggml_type_from_quant_config(self,  quant_config, layer_idx, weight_type):  
         if layer_idx < len(quant_config.moe_weight_type_map):
             layer_info = quant_config.moe_weight_type_map[layer_idx]
@@ -1646,10 +1716,30 @@ class FusedMoE(CustomOp):
             logger.info(f"Initialized lk_moe with {self.local_num_experts} experts for layer {self.layer_name} [" + 
             ("CPU" if not self.is_gpu_resident_layer else "GPU") + "]")
             return
+        if not self.supports_lk_cpu_quant_method():
+            if self.supports_vllm_quant_fallback():
+                self.disable_lk_paths(
+                    "quant_method is handled by vLLM quantized MoE kernels",
+                )
+                return
+            message = (
+                "LK MoE CPU initialization failed: unsupported quant_method=%s on layer=%s. "
+                "This layer is configured as non-GPU-resident; fallback is disabled. "
+                "Use a supported quantization method or adjust "
+                "LVLLM_GPU_RESIDENT_MOE_LAYERS/LVLLM_GPU_PREFILL_MIN_BATCH_SIZE."
+            )
+            logger.error(
+                message,
+                type(self.quant_method).__name__,
+                self.layer_name,
+            )
+            raise NotImplementedError(
+                message
+                % (type(self.quant_method).__name__, self.layer_name)
+            )
         try:  
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MarlinMoEMethod
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MoEMethod 
-            from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinMoEMethod
             from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
             from vllm.model_executor.layers.quantization.gguf import GGUFMoEMethod
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Fp8MoEMethod 
@@ -1660,11 +1750,7 @@ class FusedMoE(CustomOp):
     
                     self._process_compressed_tensors_weights(self.quant_method.strategy)
                     find_weight = True 
-                    
-                if isinstance(self.quant_method, AWQMarlinMoEMethod):
-                    self._process_awq_weights()
-                    find_weight = True 
-                
+                 
                 if isinstance(self.quant_method, GGUFMoEMethod): 
                     self._process_gguf_weights()
                     find_weight = True
@@ -1691,18 +1777,41 @@ class FusedMoE(CustomOp):
                 if isinstance(self.quant_method, UnquantizedFusedMoEMethod): 
                     self._process_regular_weights()
                     find_weight = True
-                
+                 
                 if not find_weight: 
-                    logger.error("weight not found in layer, quant_method: %s", self.quant_method) 
-                    return
-                
+                    message = (
+                        "LK MoE CPU initialization failed: no LK conversion rule "
+                        "for quant_method=%s on layer=%s."
+                    )
+                    logger.error(
+                        message,
+                        type(self.quant_method).__name__,
+                        self.layer_name,
+                    )
+                    raise RuntimeError(
+                        message
+                        % (type(self.quant_method).__name__, self.layer_name)
+                    )
+                 
                 self._initialize_cuda_graph_buffers()
                 logger.info(f"Initialized lk_moe with {self.local_num_experts} experts for layer {self.layer_name} [" + 
                 ("CPU" if not self.is_gpu_resident_layer else "GPU") + "]")
         except Exception as e:
-            logger.error(f"Failed to initialize lk_moe: {e}") 
+            if self.supports_vllm_quant_fallback():
+                self.disable_lk_paths(f"LK initialization failed with error: {e}")
+                return
             self.lk_moe = None
             self.lk_moe_config = None
+            logger.error(
+                "Failed to initialize lk_moe for layer %s with quant_method=%s: %s",
+                self.layer_name,
+                type(self.quant_method).__name__,
+                e,
+            )
+            raise RuntimeError(
+                f"LK MoE CPU initialization failed on layer={self.layer_name}, "
+                f"quant_method={type(self.quant_method).__name__}: {e}"
+            ) from e
     
     def distribute_weight_tensor(self, param_name: str, weight: torch.Tensor):  
         with torch.no_grad():
@@ -1723,6 +1832,8 @@ class FusedMoE(CustomOp):
         from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MarlinMoEMethod
         from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MoEMethod 
         if self.is_gpu_resident_layer:
+            return
+        if not self.supports_lk_cpu_path():
             return
         try:  
             with torch.no_grad():
@@ -2042,14 +2153,10 @@ class FusedMoE(CustomOp):
     
     
     def _process_awq_weights(self): 
-        
-        w13_qweight = self.w13_qweight
-        w2_qweight = self.w2_qweight
-        w13_scales = self.w13_scales
-        w2_scales = self.w2_scales
-        w13_qzeros = self.w13_qzeros
-        w2_qzeros = self.w2_qzeros
-        ValueError("AWQ Weights are not supported for lk moe ...") 
+        raise NotImplementedError(
+            "AWQ weights are not supported by LK MoE conversion yet. "
+            "Please disable LK CPU mode for this layer or use a supported quantization."
+        ) 
          
  
     def _process_fp8_weights(self, block_quant: bool):   

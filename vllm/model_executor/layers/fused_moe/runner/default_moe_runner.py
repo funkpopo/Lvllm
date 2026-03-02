@@ -57,6 +57,53 @@ def get_layer_from_name(layer_name: str) -> torch.nn.Module:
     return forward_context.no_compile_layers[layer_name]
 
 
+def _should_use_lk_cpu_path(layer: torch.nn.Module, hidden_states: torch.Tensor) -> bool:
+    if layer.is_gpu_resident_layer:
+        return False
+    if layer.should_use_gpu_prefill(hidden_states):
+        return False
+
+    quant_name = type(layer.quant_method).__name__
+    if not layer.supports_lk_cpu_quant_method():
+        if layer.supports_vllm_quant_fallback():
+            logger.warning_once(
+                "Use vLLM quantized MoE path for layer=%s quant_method=%s "
+                "because LK CPU path is unsupported.",
+                layer.layer_name,
+                quant_name,
+            )
+            return False
+        message = (
+            "LK MoE CPU execution blocked: unsupported quant_method=%s on layer=%s."
+        )
+        logger.error(
+            message,
+            quant_name,
+            layer.layer_name,
+        )
+        raise RuntimeError(message % (quant_name, layer.layer_name))
+    if not layer.supports_lk_cpu_path():
+        if layer.supports_vllm_quant_fallback():
+            logger.warning_once(
+                "Use vLLM quantized MoE path for layer=%s quant_method=%s "
+                "because LK CPU path is unavailable.",
+                layer.layer_name,
+                quant_name,
+            )
+            return False
+        message = (
+            "LK MoE CPU execution blocked: lk_moe is unavailable for "
+            "quant_method=%s on layer=%s."
+        )
+        logger.error(
+            message,
+            quant_name,
+            layer.layer_name,
+        )
+        raise RuntimeError(message % (quant_name, layer.layer_name))
+    return True
+
+
 def _moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -502,7 +549,7 @@ class DefaultMoERunner(MoERunner):
             # Matrix multiply.
             if self.quant_method.is_monolithic:
                 assert has_separate_shared_experts or self.shared_experts is None
-                if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
+                if _should_use_lk_cpu_path(layer, hidden_states):
                     topk_weights, topk_ids = self.router.select_experts(
                         hidden_states=staged_hidden_states,
                         router_logits=staged_router_logits,
@@ -524,7 +571,8 @@ class DefaultMoERunner(MoERunner):
                     hidden_states=staged_hidden_states,
                     router_logits=staged_router_logits,
                 )
-                if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
+                if _should_use_lk_cpu_path(layer, hidden_states):
+                    local_topk_ids = layer.global_to_local_expert_ids(topk_ids) if layer.use_ep else topk_ids
                     final_hidden_states = layer.forward_lk(
                         staged_hidden_states,
                         topk_weights, 
@@ -727,7 +775,7 @@ class DefaultMoERunner(MoERunner):
 
             # Matrix multiply.
             if self.quant_method.is_monolithic:
-                if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
+                if _should_use_lk_cpu_path(layer, hidden_states):
                     topk_weights, topk_ids = self.router.select_experts(
                         hidden_states=x,
                         router_logits=router_logits,
@@ -749,7 +797,7 @@ class DefaultMoERunner(MoERunner):
                     hidden_states=x_orig,
                     router_logits=router_logits,
                 )
-                if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
+                if _should_use_lk_cpu_path(layer, hidden_states):
                     local_topk_ids = layer.global_to_local_expert_ids(topk_ids) if layer.use_ep else topk_ids
                     final_hidden_states = layer.forward_lk(
                         x,
@@ -924,7 +972,7 @@ def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor,
              
             if candidate_idx not in state and len(prefetch_candidates) < available_slots:
                 candidate_layer = forward_context.no_compile_layers.get(candidate_name)
-                if candidate_layer:
+                if candidate_layer and candidate_layer.is_gpu_prefill_layer:
                     prefetch_candidates.append((candidate_idx, candidate_layer))
          
         for idx, layer_obj in prefetch_candidates:

@@ -222,7 +222,7 @@ if TYPE_CHECKING:
     LVLLM_MOE_USE_WEIGHT: Literal["KEEP", "TO_DTYPE", "INT4"] = "INT4"
     LVLLM_GPU_RESIDENT_MOE_LAYERS: str | None = None
     LVLLM_GPU_PREFILL_MIN_BATCH_SIZE: int = 0
-    LVLLM_GPU_PREFETCH_WINDOW: int = 1
+    LVLLM_GPU_PREFETCH_WINDOW: int = 3
     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
@@ -1868,7 +1868,7 @@ def get_moe_compute_strategy() -> MoeComputeStrategy:
         return MoeComputeStrategy(strategy.upper())
     except ValueError: 
         print(f"Warning: Invalid LVLLM_MOE_USE_WEIGHT value '{strategy}', using 'INT4'")
-        return MoeComputeStrategy.TO_DTYPE   
+        return MoeComputeStrategy.INT4   
 
 def get_gpu_prefetch_window() -> int:
     return environment_variables["LVLLM_GPU_PREFETCH_WINDOW"]()
