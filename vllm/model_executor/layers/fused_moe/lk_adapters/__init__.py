@@ -5,11 +5,12 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from .awq_marlin import AwqMarlinFallbackAdapter
+from .awq_marlin import AwqMarlinLkAdapter
 from .base import LkQuantAdapter
 from .compressed_wna16 import CompressedWna16LkAdapter
 from .fp8 import Fp8LkAdapter
 from .gguf import GgufLkAdapter
+from .gptq_marlin import GptqMarlinLkAdapter
 from .int8_w8a8 import Int8W8A8LkAdapter
 from .unquantized import UnquantizedLkAdapter
 
@@ -22,7 +23,8 @@ def get_lk_quant_adapters() -> tuple[LkQuantAdapter, ...]:
         Int8W8A8LkAdapter(),
         CompressedWna16LkAdapter(),
         GgufLkAdapter(),
-        AwqMarlinFallbackAdapter(),
+        AwqMarlinLkAdapter(),
+        GptqMarlinLkAdapter(),
     )
 
 

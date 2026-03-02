@@ -54,6 +54,8 @@ def test_lk_quant_registry_supports_expected_baseline_types():
     assert "CompressedTensorsWNA16MoEMethod" in cpu_supported
     assert "ExpertsInt8MoEMethod" in cpu_supported
     assert "GGUFMoEMethod" in cpu_supported
+    assert "AWQMarlinMoEMethod" in cpu_supported
+    assert "GPTQMarlinMoEMethod" in cpu_supported
 
     assert "UnquantizedFusedMoEMethod" in prefill_supported
     assert "Fp8MoEMethod" in prefill_supported
@@ -62,6 +64,8 @@ def test_lk_quant_registry_supports_expected_baseline_types():
     assert "CompressedTensorsWNA16MoEMethod" in prefill_supported
     assert "ExpertsInt8MoEMethod" in prefill_supported
     assert "GGUFMoEMethod" not in prefill_supported
+    assert "AWQMarlinMoEMethod" not in prefill_supported
+    assert "GPTQMarlinMoEMethod" not in prefill_supported
 
 
 @pytest.mark.parametrize(
@@ -75,8 +79,9 @@ def test_lk_quant_registry_supports_expected_baseline_types():
         # Mainstream upstream quant methods should safely fall back to vLLM
         # when LK CPU path is unavailable.
         ("ExpertsInt8MoEMethod", True),
+        ("AWQMarlinMoEMethod", True),
         ("BitsAndBytesMoEMethod", False),
-        ("GPTQMarlinMoEMethod", False),
+        ("GPTQMarlinMoEMethod", True),
     ],
 )
 @pytest.mark.parametrize("layer_mode", ["resident", "prefill", "cpu"])
