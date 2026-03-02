@@ -50,13 +50,17 @@ def test_lk_quant_registry_supports_expected_baseline_types():
     assert "UnquantizedFusedMoEMethod" in cpu_supported
     assert "Fp8MoEMethod" in cpu_supported
     assert "CompressedTensorsW8A8Fp8MoEMethod" in cpu_supported
+    assert "CompressedTensorsW8A8Int8MoEMethod" in cpu_supported
     assert "CompressedTensorsWNA16MoEMethod" in cpu_supported
+    assert "ExpertsInt8MoEMethod" in cpu_supported
     assert "GGUFMoEMethod" in cpu_supported
 
     assert "UnquantizedFusedMoEMethod" in prefill_supported
     assert "Fp8MoEMethod" in prefill_supported
     assert "CompressedTensorsW8A8Fp8MoEMethod" in prefill_supported
+    assert "CompressedTensorsW8A8Int8MoEMethod" in prefill_supported
     assert "CompressedTensorsWNA16MoEMethod" in prefill_supported
+    assert "ExpertsInt8MoEMethod" in prefill_supported
     assert "GGUFMoEMethod" not in prefill_supported
 
 
@@ -66,10 +70,11 @@ def test_lk_quant_registry_supports_expected_baseline_types():
         ("UnquantizedFusedMoEMethod", True),
         ("Fp8MoEMethod", True),
         ("CompressedTensorsWNA16MoEMethod", True),
+        ("CompressedTensorsW8A8Int8MoEMethod", True),
         ("GGUFMoEMethod", True),
         # Mainstream upstream quant methods should safely fall back to vLLM
         # when LK CPU path is unavailable.
-        ("ExpertsInt8MoEMethod", False),
+        ("ExpertsInt8MoEMethod", True),
         ("BitsAndBytesMoEMethod", False),
         ("GPTQMarlinMoEMethod", False),
     ],
@@ -109,14 +114,14 @@ def test_unknown_quant_method_uses_vllm_fallback():
 
 def test_gpu_prefill_unsupported_message_exposes_support_matrix():
     layer = _make_layer(
-        "ExpertsInt8MoEMethod",
+        "BitsAndBytesMoEMethod",
         layer_mode="prefill",
         lk_ready=True,
         use_ep=False,
     )
 
     message = layer.format_lk_gpu_prefill_unsupported_message()
-    assert "ExpertsInt8MoEMethod" in message
+    assert "BitsAndBytesMoEMethod" in message
 
     supported = get_lk_gpu_prefill_supported_quant_method_names()
     assert len(supported) > 0
@@ -124,9 +129,21 @@ def test_gpu_prefill_unsupported_message_exposes_support_matrix():
         assert quant_name in message
 
 
-def test_resolve_gpu_prefill_handler_reports_supported_quant_methods():
+def test_resolve_gpu_prefill_handler_for_supported_quant_method():
     layer = _make_layer(
         "ExpertsInt8MoEMethod",
+        layer_mode="prefill",
+        lk_ready=True,
+        use_ep=False,
+    )
+
+    handler = _resolve_gpu_prefill_handler(layer, action="prepare")
+    assert callable(handler)
+
+
+def test_resolve_gpu_prefill_handler_reports_supported_quant_methods():
+    layer = _make_layer(
+        "BitsAndBytesMoEMethod",
         layer_mode="prefill",
         lk_ready=True,
         use_ep=False,
@@ -135,5 +152,5 @@ def test_resolve_gpu_prefill_handler_reports_supported_quant_methods():
     with pytest.raises(ValueError) as exc_info:
         _resolve_gpu_prefill_handler(layer, action="prepare")
 
-    assert "ExpertsInt8MoEMethod" in str(exc_info.value)
+    assert "BitsAndBytesMoEMethod" in str(exc_info.value)
     assert "Supported quant_method(s)" in str(exc_info.value)

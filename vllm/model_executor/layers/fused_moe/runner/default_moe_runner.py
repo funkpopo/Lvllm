@@ -968,7 +968,20 @@ def moe_cleanup(layer, layer_name: str, hidden_states: torch.Tensor,
                 layer_id = id(layer_obj)
                 if layer_id in forward_context._prefetch_events:
                     del forward_context._prefetch_events[layer_id]
-        
+
+
+def _disable_layer_gpu_prefill(layer: torch.nn.Module, reason: str) -> None:
+    if getattr(layer, "is_gpu_prefill_layer", False):
+        layer.is_gpu_prefill_layer = False
+    layer_name = getattr(layer, "layer_name", "<unknown>")
+    quant_method = getattr(layer, "quant_method", None)
+    quant_name = type(quant_method).__name__ if quant_method is not None else "<none>"
+    logger.warning_once(
+        "Disable LK GPU prefill for layer=%s quant_method=%s. Reason: %s",
+        layer_name,
+        quant_name,
+        reason,
+    )
 
 
 def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor, 
@@ -983,6 +996,14 @@ def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor,
         return
     
     if not layer.should_use_gpu_prefill(hidden_states):
+        return
+
+    supports_gpu_prefill = getattr(layer, "supports_lk_gpu_prefill", None)
+    if callable(supports_gpu_prefill) and not supports_gpu_prefill():
+        _disable_layer_gpu_prefill(
+            layer,
+            "quant_method is unsupported by LK GPU prefill or lk_moe is unavailable",
+        )
         return
     
     if not hasattr(forward_context, '_prefetch_stream'):
@@ -1043,6 +1064,18 @@ def moe_prefetch(layer, layer_name: str, hidden_states: torch.Tensor,
                 continue
             if candidate_layer.is_gpu_resident_layer:
                 continue
+            candidate_supports_gpu_prefill = getattr(
+                candidate_layer, "supports_lk_gpu_prefill", None
+            )
+            if (
+                callable(candidate_supports_gpu_prefill)
+                and not candidate_supports_gpu_prefill()
+            ):
+                _disable_layer_gpu_prefill(
+                    candidate_layer,
+                    "quant_method is unsupported by LK GPU prefill or lk_moe is unavailable",
+                )
+                continue
             if candidate_layer.is_gpu_prefill_layer:
                 prefetch_candidates.append((candidate_name, candidate_layer))
          
@@ -1056,199 +1089,306 @@ def collect_weight_from_moe(layer, param_name: str) -> torch.Tensor:
     dtype_name = param_name + "_origin_dtype"
     if hasattr(layer, shape_name) and hasattr(layer, dtype_name):
         origin_shape = getattr(layer, shape_name)
-        origin_dtype = getattr(layer, dtype_name) 
-        shape_array = torch.tensor(origin_shape, dtype=torch.int64)
-        weight_cpu = torch.empty(
-            origin_shape,
-            dtype=origin_dtype, 
-            device="cpu",
-            requires_grad=False, 
-            pin_memory=pin_memory, 
-        ).contiguous() 
+        origin_dtype = getattr(layer, dtype_name)
+
+        # Reuse pinned host staging buffers and shape metadata across prefetch
+        # cycles to reduce allocator pressure in long-context workloads.
+        if not hasattr(layer, "_lk_prefetch_cpu_staging"):
+            layer._lk_prefetch_cpu_staging = {}
+        if not hasattr(layer, "_lk_prefetch_shape_cache"):
+            layer._lk_prefetch_shape_cache = {}
+        if not hasattr(layer, "_lk_prefetch_shape_tuple_cache"):
+            layer._lk_prefetch_shape_tuple_cache = {}
+
+        origin_shape_tuple = tuple(origin_shape)
+
+        weight_cpu = layer._lk_prefetch_cpu_staging.get(param_name)
+        if (
+            weight_cpu is None
+            or tuple(weight_cpu.shape) != origin_shape_tuple
+            or weight_cpu.dtype != origin_dtype
+        ):
+            weight_cpu = torch.empty(
+                origin_shape,
+                dtype=origin_dtype,
+                device="cpu",
+                requires_grad=False,
+                pin_memory=pin_memory,
+            ).contiguous()
+            layer._lk_prefetch_cpu_staging[param_name] = weight_cpu
+
+        shape_array = layer._lk_prefetch_shape_cache.get(param_name)
+        cached_shape = layer._lk_prefetch_shape_tuple_cache.get(param_name)
+        if shape_array is None or cached_shape != origin_shape_tuple:
+            shape_array = torch.tensor(origin_shape, dtype=torch.int64).contiguous()
+            layer._lk_prefetch_shape_cache[param_name] = shape_array
+            layer._lk_prefetch_shape_tuple_cache[param_name] = origin_shape_tuple
+
         layer.lk_moe.collectWeight(
-                param_name,
-                weight_cpu.data_ptr(),
-                shape_array.data_ptr(), 
-                weight_cpu[0].nbytes,
-            )
-        del shape_array
+            param_name,
+            weight_cpu.data_ptr(),
+            shape_array.data_ptr(),
+            weight_cpu[0].nbytes,
+        )
         return weight_cpu
-        
-            
-def moe_prepare_gpu_prefill_fp8(layer, forward_context: ForwardContext, device: torch.device): 
+
+    raise RuntimeError(
+        "Missing LK weight metadata for param=%s on layer=%s."
+        % (param_name, layer.layer_name)
+    )
+
+
+def _copy_or_replace_param(
+    owner: object,
+    param_name: str,
+    weight_cpu: torch.Tensor,
+    device: torch.device,
+) -> None:
+    existing = getattr(owner, param_name, None)
+    if (
+        isinstance(existing, torch.nn.Parameter)
+        and tuple(existing.shape) == tuple(weight_cpu.shape)
+        and existing.dtype == weight_cpu.dtype
+        and existing.device == device
+    ):
+        existing.data.copy_(weight_cpu, non_blocking=True)
+        return
+
+    setattr(
+        owner,
+        param_name,
+        torch.nn.Parameter(
+            weight_cpu.to(device, non_blocking=True),
+            requires_grad=False,
+        ),
+    )
+
+
+def _empty_param(owner: object, param_name: str, device: torch.device) -> None:
+    if not hasattr(owner, param_name):
+        return
+    setattr(
+        owner,
+        param_name,
+        torch.nn.Parameter(torch.empty(0, device=device), requires_grad=False),
+    )
+
+
+def moe_prepare_gpu_prefill_fp8(
+    layer, forward_context: ForwardContext, device: torch.device
+):
+    del forward_context
     param_names = [
         "w13_weight",
-        "w2_weight", 
+        "w2_weight",
     ]
-    
+
+    block_quant = getattr(layer.quant_method, "block_quant", False)
     scale_names = [
-        "w13_weight_scale_inv" if layer.quant_method.block_quant else "w13_weight_scale",
-        "w2_weight_scale_inv" if layer.quant_method.block_quant else "w2_weight_scale",  
+        "w13_weight_scale_inv" if block_quant else "w13_weight_scale",
+        "w2_weight_scale_inv" if block_quant else "w2_weight_scale",
     ]
-    
+
     quant_config_names = [
         "w1_scale",
         "w2_scale",
-    ] 
-    
+    ]
+
     for param_name in param_names:
         weight_cpu = collect_weight_from_moe(layer, param_name)
-        setattr(layer, param_name, torch.nn.Parameter(
-            weight_cpu.to(device, non_blocking=True), 
-            requires_grad=False
-        ))
-     
-    use_quant_config = (
-        hasattr(layer, "moe_quant_config") and 
-        hasattr(layer.moe_quant_config, quant_config_names[0]) and
-        hasattr(layer.moe_quant_config, quant_config_names[1])
-    )
-    
-    if use_quant_config: 
-        for scale_name in quant_config_names: 
-            weight_cpu = collect_weight_from_moe(layer, scale_name)
-            setattr(layer.moe_quant_config, scale_name, torch.nn.Parameter(
-                weight_cpu.to(device, non_blocking=True), 
-                requires_grad=False
-            ))
-    else: 
-        for scale_name in scale_names:
-            weight_cpu = collect_weight_from_moe(layer, scale_name)
-            setattr(layer, scale_name, torch.nn.Parameter(
-                weight_cpu.to(device, non_blocking=True), 
-                requires_grad=False
-            ))
+        _copy_or_replace_param(layer, param_name, weight_cpu, device)
 
-
-def moe_clean_gpu_prefill_fp8(layer):    
-    param_names = [
-        "w13_weight",
-        "w2_weight",  
-    ]
-    
-    scale_names = [
-        "w13_weight_scale_inv" if layer.quant_method.block_quant else "w13_weight_scale",
-        "w2_weight_scale_inv" if layer.quant_method.block_quant else "w2_weight_scale",  
-    ]
-    
-    quant_config_names = [
-        "w1_scale",
-        "w2_scale",
-    ]
-     
-    for param_name in param_names:
-        if hasattr(layer, param_name):
-            setattr(layer, param_name, torch.nn.Parameter(
-                torch.empty(0, device=torch.cuda.current_device()), 
-                requires_grad=False
-            ))
-     
     use_quant_config = (
-        hasattr(layer, "moe_quant_config") and 
-        hasattr(layer.moe_quant_config, quant_config_names[0]) and
-        hasattr(layer.moe_quant_config, quant_config_names[1])
+        hasattr(layer, "moe_quant_config")
+        and hasattr(layer.moe_quant_config, quant_config_names[0])
+        and hasattr(layer.moe_quant_config, quant_config_names[1])
     )
-    
-    if use_quant_config: 
+
+    if use_quant_config:
         for scale_name in quant_config_names:
-            if hasattr(layer.moe_quant_config, scale_name):
-                setattr(layer.moe_quant_config, scale_name, torch.nn.Parameter(
-                    torch.empty(0, device=torch.cuda.current_device()), 
-                    requires_grad=False
-                ))
-    else: 
+            weight_cpu = collect_weight_from_moe(layer, scale_name)
+            _copy_or_replace_param(layer.moe_quant_config, scale_name, weight_cpu, device)
+    else:
         for scale_name in scale_names:
-            if hasattr(layer, scale_name):
-                setattr(layer, scale_name, torch.nn.Parameter(
-                    torch.empty(0, device=torch.cuda.current_device()), 
-                    requires_grad=False
-                ))
-        
+            weight_cpu = collect_weight_from_moe(layer, scale_name)
+            _copy_or_replace_param(layer, scale_name, weight_cpu, device)
 
-def moe_prepare_gpu_prefill_wna16(layer, forward_context: ForwardContext, device: torch.device):  
-    
+
+def moe_clean_gpu_prefill_fp8(layer):
+    param_names = [
+        "w13_weight",
+        "w2_weight",
+    ]
+
+    block_quant = getattr(layer.quant_method, "block_quant", False)
+    scale_names = [
+        "w13_weight_scale_inv" if block_quant else "w13_weight_scale",
+        "w2_weight_scale_inv" if block_quant else "w2_weight_scale",
+    ]
+
+    quant_config_names = [
+        "w1_scale",
+        "w2_scale",
+    ]
+    device = torch.device(torch.cuda.current_device())
+
+    for param_name in param_names:
+        _empty_param(layer, param_name, device)
+
+    use_quant_config = (
+        hasattr(layer, "moe_quant_config")
+        and hasattr(layer.moe_quant_config, quant_config_names[0])
+        and hasattr(layer.moe_quant_config, quant_config_names[1])
+    )
+
+    if use_quant_config:
+        for scale_name in quant_config_names:
+            _empty_param(layer.moe_quant_config, scale_name, device)
+    else:
+        for scale_name in scale_names:
+            _empty_param(layer, scale_name, device)
+
+
+def moe_prepare_gpu_prefill_channel_scale(
+    layer, forward_context: ForwardContext, device: torch.device
+):
+    del forward_context
+    for param_name in (
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale",
+        "w2_weight_scale",
+    ):
+        weight_cpu = collect_weight_from_moe(layer, param_name)
+        _copy_or_replace_param(layer, param_name, weight_cpu, device)
+
+
+def moe_clean_gpu_prefill_channel_scale(layer):
+    device = torch.device(torch.cuda.current_device())
+    for param_name in (
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale",
+        "w2_weight_scale",
+    ):
+        _empty_param(layer, param_name, device)
+
+
+def moe_prepare_gpu_prefill_wna16(
+    layer, forward_context: ForwardContext, device: torch.device
+):
+    del forward_context
     param_names = [
         "w13_weight_packed",
-        "w2_weight_packed", 
+        "w2_weight_packed",
         "w13_weight_scale",
         "w2_weight_scale",
         "w13_g_idx_sort_indices",
         "w2_g_idx_sort_indices",
         "w13_weight_shape",
-        "w2_weight_shape", 
-    ] 
-    
+        "w2_weight_shape",
+    ]
+
     for param_name in param_names:
         weight_cpu = collect_weight_from_moe(layer, param_name)
-        setattr(layer, param_name, torch.nn.Parameter(weight_cpu.to(device, non_blocking=True), requires_grad=False))
-        
-def moe_clean_gpu_prefill_wna16(layer):    
+        _copy_or_replace_param(layer, param_name, weight_cpu, device)
+
+
+def moe_clean_gpu_prefill_wna16(layer):
     param_names = [
         "w13_weight_packed",
-        "w2_weight_packed", 
+        "w2_weight_packed",
         "w13_weight_scale",
         "w2_weight_scale",
         "w13_g_idx_sort_indices",
         "w2_g_idx_sort_indices",
         "w13_weight_shape",
-        "w2_weight_shape", 
+        "w2_weight_shape",
     ]
+    device = torch.device(torch.cuda.current_device())
     for param_name in param_names:
-        if hasattr(layer, param_name):
-           setattr(layer, param_name, torch.nn.Parameter(torch.empty(0,  device=torch.cuda.current_device()), requires_grad=False))
+        _empty_param(layer, param_name, device)
 
-def moe_prepare_gpu_prefill_regular(layer, forward_context: ForwardContext, device: torch.device):
+
+def moe_prepare_gpu_prefill_regular(
+    layer, forward_context: ForwardContext, device: torch.device
+):
+    del forward_context
     pin_memory = is_pin_memory_available()
-    w13_weight_cpu = torch.zeros(
-            (layer.global_num_experts, layer.intermediate_size_per_partition * 2, layer.hidden_size),
-            dtype=layer.moe_config.in_dtype, 
-            device="cpu",
-            requires_grad=False, 
-            pin_memory=pin_memory, 
-        ).contiguous() 
-            
-    layer.lk_moe.collect_weights(
-        True,  
-        0,
-        0,
-        w13_weight_cpu.data_ptr(),  
-        0  # 0   gate  
-    )
-    
-    layer.lk_moe.collect_weights(
-        True,  
-        0,
-        0,
-        w13_weight_cpu.data_ptr(),  
-        1  # 1   up
-    )
-    
-    layer.w13_weight = torch.nn.Parameter(w13_weight_cpu.to(device, non_blocking=True), requires_grad=False)
-    
-    # [global_num_experts, hidden_size, intermediate_size_per_partition]
-    w2_weight_cpu = torch.zeros(
-        (layer.global_num_experts, layer.hidden_size, layer.intermediate_size_per_partition),
-        dtype=layer.moe_config.in_dtype,  
-        device="cpu",
-        requires_grad=False, 
-        pin_memory=pin_memory, 
-    ).contiguous() 
-    
-    layer.lk_moe.collect_weights(
-        True,  
-        0,
-        0,
-        w2_weight_cpu.data_ptr(),  
-        2  # w2
-    )
-    layer.w2_weight = torch.nn.Parameter(w2_weight_cpu.to(device, non_blocking=True), requires_grad=False) 
-    del w13_weight_cpu 
-    del w2_weight_cpu 
 
-def moe_clean_gpu_prefill_regular(layer):  
-    setattr(layer, "w13_weight", torch.nn.Parameter(torch.empty(0,  device=torch.cuda.current_device()), requires_grad=False))
-    setattr(layer, "w2_weight", torch.nn.Parameter(torch.empty(0,  device=torch.cuda.current_device()), requires_grad=False))
-     
+    w13_shape = (
+        layer.global_num_experts,
+        layer.intermediate_size_per_partition * 2,
+        layer.hidden_size,
+    )
+    w2_shape = (
+        layer.global_num_experts,
+        layer.hidden_size,
+        layer.intermediate_size_per_partition,
+    )
+    weight_dtype = layer.moe_config.in_dtype
+
+    w13_weight_cpu = getattr(layer, "_lk_prefetch_regular_w13", None)
+    if (
+        w13_weight_cpu is None
+        or tuple(w13_weight_cpu.shape) != w13_shape
+        or w13_weight_cpu.dtype != weight_dtype
+    ):
+        w13_weight_cpu = torch.zeros(
+            w13_shape,
+            dtype=weight_dtype,
+            device="cpu",
+            requires_grad=False,
+            pin_memory=pin_memory,
+        ).contiguous()
+        layer._lk_prefetch_regular_w13 = w13_weight_cpu
+
+    w2_weight_cpu = getattr(layer, "_lk_prefetch_regular_w2", None)
+    if (
+        w2_weight_cpu is None
+        or tuple(w2_weight_cpu.shape) != w2_shape
+        or w2_weight_cpu.dtype != weight_dtype
+    ):
+        w2_weight_cpu = torch.zeros(
+            w2_shape,
+            dtype=weight_dtype,
+            device="cpu",
+            requires_grad=False,
+            pin_memory=pin_memory,
+        ).contiguous()
+        layer._lk_prefetch_regular_w2 = w2_weight_cpu
+
+    layer.lk_moe.collect_weights(
+        True,
+        0,
+        0,
+        w13_weight_cpu.data_ptr(),
+        0,
+    )
+    layer.lk_moe.collect_weights(
+        True,
+        0,
+        0,
+        w13_weight_cpu.data_ptr(),
+        1,
+    )
+    layer.lk_moe.collect_weights(
+        True,
+        0,
+        0,
+        w2_weight_cpu.data_ptr(),
+        2,
+    )
+
+    _copy_or_replace_param(layer, "w13_weight", w13_weight_cpu, device)
+    _copy_or_replace_param(layer, "w2_weight", w2_weight_cpu, device)
+
+
+def moe_clean_gpu_prefill_regular(layer):
+    device = torch.device(torch.cuda.current_device())
+    _empty_param(layer, "w13_weight", device)
+    _empty_param(layer, "w2_weight", device)
+
 
 _GPU_PREFILL_PREPARE_HANDLERS: dict[
     str, Callable[[torch.nn.Module, ForwardContext, torch.device], None]
@@ -1258,6 +1398,8 @@ _GPU_PREFILL_PREPARE_HANDLERS: dict[
     "CompressedTensorsWNA16MoEMethod": moe_prepare_gpu_prefill_wna16,
     "Fp8MoEMethod": moe_prepare_gpu_prefill_fp8,
     "CompressedTensorsW8A8Fp8MoEMethod": moe_prepare_gpu_prefill_fp8,
+    "CompressedTensorsW8A8Int8MoEMethod": moe_prepare_gpu_prefill_channel_scale,
+    "ExpertsInt8MoEMethod": moe_prepare_gpu_prefill_channel_scale,
 }
 
 _GPU_PREFILL_CLEAN_HANDLERS: dict[str, Callable[[torch.nn.Module], None]] = {
@@ -1266,6 +1408,8 @@ _GPU_PREFILL_CLEAN_HANDLERS: dict[str, Callable[[torch.nn.Module], None]] = {
     "CompressedTensorsWNA16MoEMethod": moe_clean_gpu_prefill_wna16,
     "Fp8MoEMethod": moe_clean_gpu_prefill_fp8,
     "CompressedTensorsW8A8Fp8MoEMethod": moe_clean_gpu_prefill_fp8,
+    "CompressedTensorsW8A8Int8MoEMethod": moe_clean_gpu_prefill_channel_scale,
+    "ExpertsInt8MoEMethod": moe_clean_gpu_prefill_channel_scale,
 }
 
 
@@ -1298,7 +1442,13 @@ def moe_prepare_gpu_prefill(layer, forward_context: ForwardContext, device: torc
             prefetch_events = forward_context._prefetch_events
 
             with torch.cuda.stream(prefetch_stream):
-                prepare_handler = _resolve_gpu_prefill_handler(layer, action="prepare")
+                try:
+                    prepare_handler = _resolve_gpu_prefill_handler(
+                        layer, action="prepare"
+                    )
+                except Exception as e:
+                    _disable_layer_gpu_prefill(layer, str(e))
+                    return
                 prepare_handler(layer, forward_context, device)
 
                 layer_id = id(layer)
@@ -1309,7 +1459,11 @@ def moe_prepare_gpu_prefill(layer, forward_context: ForwardContext, device: torc
 
 def moe_clean_gpu_prefill(layer):
     with torch.no_grad():
-        clean_handler = _resolve_gpu_prefill_handler(layer, action="clean")
+        try:
+            clean_handler = _resolve_gpu_prefill_handler(layer, action="clean")
+        except Exception as e:
+            _disable_layer_gpu_prefill(layer, str(e))
+            return
         clean_handler(layer)
 
 def moe_wait_prefetch(layer, hidden_states: torch.Tensor, forward_context: ForwardContext):

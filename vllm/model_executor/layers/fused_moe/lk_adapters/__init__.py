@@ -10,6 +10,7 @@ from .base import LkQuantAdapter
 from .compressed_wna16 import CompressedWna16LkAdapter
 from .fp8 import Fp8LkAdapter
 from .gguf import GgufLkAdapter
+from .int8_w8a8 import Int8W8A8LkAdapter
 from .unquantized import UnquantizedLkAdapter
 
 
@@ -18,6 +19,7 @@ def get_lk_quant_adapters() -> tuple[LkQuantAdapter, ...]:
     return (
         UnquantizedLkAdapter(),
         Fp8LkAdapter(),
+        Int8W8A8LkAdapter(),
         CompressedWna16LkAdapter(),
         GgufLkAdapter(),
         AwqMarlinFallbackAdapter(),
@@ -55,4 +57,3 @@ def get_lk_cpu_supported_quant_method_names() -> tuple[str, ...]:
 
 def get_lk_gpu_prefill_supported_quant_method_names() -> tuple[str, ...]:
     return _collect_supported_quant_methods(include_gpu_prefill=True)
-
