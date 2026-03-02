@@ -1180,38 +1180,54 @@ def _empty_param(owner: object, param_name: str, device: torch.device) -> None:
     )
 
 
+def _get_fp8_prefill_profile(
+    layer,
+) -> tuple[tuple[str, ...], tuple[str, ...], str]:
+    cache_attr = "_lk_fp8_prefill_profile"
+    cached_profile = getattr(layer, cache_attr, None)
+    if (
+        isinstance(cached_profile, tuple)
+        and len(cached_profile) == 3
+        and isinstance(cached_profile[0], tuple)
+        and isinstance(cached_profile[1], tuple)
+        and isinstance(cached_profile[2], str)
+    ):
+        return cached_profile
+
+    param_names = ("w13_weight", "w2_weight")
+    block_quant = getattr(layer.quant_method, "block_quant", False)
+    layer_scale_names = (
+        ("w13_weight_scale_inv", "w2_weight_scale_inv")
+        if block_quant
+        else ("w13_weight_scale", "w2_weight_scale")
+    )
+    quant_config_names = ("w1_scale", "w2_scale")
+
+    quant_config = layer.moe_quant_config
+    use_quant_config = quant_config is not None and all(
+        hasattr(quant_config, scale_name) for scale_name in quant_config_names
+    )
+    if use_quant_config:
+        profile = (param_names, quant_config_names, "moe_quant_config")
+    else:
+        profile = (param_names, layer_scale_names, "layer")
+
+    setattr(layer, cache_attr, profile)
+    return profile
+
+
 def moe_prepare_gpu_prefill_fp8(
     layer, forward_context: ForwardContext, device: torch.device
 ):
     del forward_context
-    param_names = [
-        "w13_weight",
-        "w2_weight",
-    ]
-
-    block_quant = getattr(layer.quant_method, "block_quant", False)
-    scale_names = [
-        "w13_weight_scale_inv" if block_quant else "w13_weight_scale",
-        "w2_weight_scale_inv" if block_quant else "w2_weight_scale",
-    ]
-
-    quant_config_names = [
-        "w1_scale",
-        "w2_scale",
-    ]
+    param_names, scale_names, scale_owner = _get_fp8_prefill_profile(layer)
 
     for param_name in param_names:
         weight_cpu = collect_weight_from_moe(layer, param_name)
         _copy_or_replace_param(layer, param_name, weight_cpu, device)
 
-    use_quant_config = (
-        hasattr(layer, "moe_quant_config")
-        and hasattr(layer.moe_quant_config, quant_config_names[0])
-        and hasattr(layer.moe_quant_config, quant_config_names[1])
-    )
-
-    if use_quant_config:
-        for scale_name in quant_config_names:
+    if scale_owner == "moe_quant_config":
+        for scale_name in scale_names:
             weight_cpu = collect_weight_from_moe(layer, scale_name)
             _copy_or_replace_param(layer.moe_quant_config, scale_name, weight_cpu, device)
     else:
@@ -1221,34 +1237,14 @@ def moe_prepare_gpu_prefill_fp8(
 
 
 def moe_clean_gpu_prefill_fp8(layer):
-    param_names = [
-        "w13_weight",
-        "w2_weight",
-    ]
-
-    block_quant = getattr(layer.quant_method, "block_quant", False)
-    scale_names = [
-        "w13_weight_scale_inv" if block_quant else "w13_weight_scale",
-        "w2_weight_scale_inv" if block_quant else "w2_weight_scale",
-    ]
-
-    quant_config_names = [
-        "w1_scale",
-        "w2_scale",
-    ]
+    param_names, scale_names, scale_owner = _get_fp8_prefill_profile(layer)
     device = torch.device(torch.cuda.current_device())
 
     for param_name in param_names:
         _empty_param(layer, param_name, device)
 
-    use_quant_config = (
-        hasattr(layer, "moe_quant_config")
-        and hasattr(layer.moe_quant_config, quant_config_names[0])
-        and hasattr(layer.moe_quant_config, quant_config_names[1])
-    )
-
-    if use_quant_config:
-        for scale_name in quant_config_names:
+    if scale_owner == "moe_quant_config":
+        for scale_name in scale_names:
             _empty_param(layer.moe_quant_config, scale_name, device)
     else:
         for scale_name in scale_names:
@@ -1299,6 +1295,11 @@ def _clean_gpu_prefill_quant_params(layer, param_names: tuple[str, ...]):
 
 
 def _get_awq_marlin_prefill_param_names(layer) -> tuple[str, ...]:
+    cache_attr = "_lk_awq_marlin_prefill_param_names"
+    cached_names = getattr(layer, cache_attr, None)
+    if isinstance(cached_names, tuple):
+        return cached_names
+
     names: list[str] = [
         "w13_qweight",
         "w2_qweight",
@@ -1312,10 +1313,17 @@ def _get_awq_marlin_prefill_param_names(layer) -> tuple[str, ...]:
         names.append("w13_input_global_scale")
     if hasattr(layer, "w2_input_global_scale"):
         names.append("w2_input_global_scale")
-    return tuple(names)
+    names_tuple = tuple(names)
+    setattr(layer, cache_attr, names_tuple)
+    return names_tuple
 
 
 def _get_gptq_marlin_prefill_param_names(layer) -> tuple[str, ...]:
+    cache_attr = "_lk_gptq_marlin_prefill_param_names"
+    cached_names = getattr(layer, cache_attr, None)
+    if isinstance(cached_names, tuple):
+        return cached_names
+
     names: list[str] = [
         "w13_qweight",
         "w2_qweight",
@@ -1338,7 +1346,9 @@ def _get_gptq_marlin_prefill_param_names(layer) -> tuple[str, ...]:
         names.append("w13_input_global_scale")
     if hasattr(layer, "w2_input_global_scale"):
         names.append("w2_input_global_scale")
-    return tuple(names)
+    names_tuple = tuple(names)
+    setattr(layer, cache_attr, names_tuple)
+    return names_tuple
 
 
 def moe_prepare_gpu_prefill_awq_marlin(

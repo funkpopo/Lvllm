@@ -715,6 +715,12 @@ class FusedMoE(CustomOp):
             delattr(self, "_lk_quant_adapter")
         if hasattr(self, "_lk_quant_method_name"):
             delattr(self, "_lk_quant_method_name")
+        if hasattr(self, "_lk_fp8_prefill_profile"):
+            delattr(self, "_lk_fp8_prefill_profile")
+        if hasattr(self, "_lk_awq_marlin_prefill_param_names"):
+            delattr(self, "_lk_awq_marlin_prefill_param_names")
+        if hasattr(self, "_lk_gptq_marlin_prefill_param_names"):
+            delattr(self, "_lk_gptq_marlin_prefill_param_names")
         # We need to force reconstruction of runner because we're swapping out
         # the quant_method with a FusedMoEModularMethod. This logic can go
         # away once the FusedMoEModularMethod is eliminated.
