@@ -121,7 +121,7 @@ class MultiprocExecutor(Executor):
         )
 
         # Set multiprocessing envs
-        set_multiprocessing_worker_envs()
+        set_multiprocessing_worker_envs(local_world_size=self.local_world_size)
 
         # use the loopback address get_loopback_ip() for communication.
         distributed_init_method = get_distributed_init_method(
@@ -915,19 +915,41 @@ class WorkerProc:
         decorate_logs(process_name)
 
 
-def set_multiprocessing_worker_envs():
+def set_multiprocessing_worker_envs(*, local_world_size: int | None = None):
     """Set up environment variables that should be used when there are workers
     in a multiprocessing environment. This should be called by the parent
     process before worker processes are created"""
 
     _maybe_force_spawn()
 
-    # Configure thread parallelism if OMP_NUM_THREADS isn't set
-    #
-    # Helps to avoid CPU contention. The default of spawning a thread per
-    # core combined with multiprocessing for each GPU can have a negative
-    # impact on performance. The contention is amplified when running in a
-    # container where CPU limits can cause throttling.
+    lk_feature_enabled = envs.is_lk_moe_feature_enabled()
+    if lk_feature_enabled and envs.is_lvllm_hw_aware_tuning_enabled():
+        if "LK_THREADS" not in os.environ:
+            recommended_lk_threads = envs.get_recommended_lk_threads(
+                local_world_size=local_world_size
+            )
+            os.environ["LK_THREADS"] = str(recommended_lk_threads)
+            logger.info(
+                "Auto-tuned LK_THREADS=%d (hardware-aware recommendation).",
+                recommended_lk_threads,
+            )
+
+    if lk_feature_enabled and "OMP_NUM_THREADS" not in os.environ:
+        try:
+            lk_threads = int(os.environ.get("LK_THREADS", ""))
+        except ValueError:
+            lk_threads = 0
+        if lk_threads > 0:
+            os.environ["OMP_NUM_THREADS"] = str(lk_threads)
+            torch.set_num_threads(lk_threads)
+            logger.info(
+                "Set OMP_NUM_THREADS=%d to match LK_THREADS for LVLLM hybrid execution.",
+                lk_threads,
+            )
+            return
+
+    # Configure thread parallelism if OMP_NUM_THREADS isn't set.
+    # Helps to avoid CPU contention in generic vLLM multiprocessing workloads.
     default_omp_num_threads = 1
     if (
         "OMP_NUM_THREADS" not in os.environ

@@ -351,14 +351,15 @@ vllm serve \
 | Environment Variable | Type | Default Value | Description | Notes |
 |--------|------|--------|------|------|
 | `LK_THREAD_BINDING` | Performance Parameter | `CPU_CORE` | Thread binding policy: `CPU_CORE` - bind by CPU core, `NUMA_NODE` - bind by NUMA node | Default is binding by CPU core, when encountering performance issues, you can try binding by NUMA node |
-| `LK_THREADS` | Performance Parameter | Auto-calculated | Number of threads: physical cores - 4 | For multi-GPU multi-process, (physical cores - 4) divided by number of processes |
-| `OMP_NUM_THREADS` | Performance Parameter | System logical core count | OpenMP thread count: set to same as `LK_THREADS` | |
+| `LK_THREADS` | Performance Parameter | Hardware-aware auto recommendation | Recommended per-worker thread count based on physical cores and worker processes | Explicit `LK_THREADS` still overrides auto recommendation |
+| `OMP_NUM_THREADS` | Performance Parameter | Follows `LK_THREADS` when unset | OpenMP thread count for worker-side compute | Explicit `OMP_NUM_THREADS` still overrides auto recommendation |
 <!-- BEGIN_LVLLM_ENV_TABLE -->
 | `LVLLM_MOE_NUMA_ENABLED` | Core Parameter | `0` | Whether to enable hybrid inference: `1`-enabled, `0`-disabled. | Set to `0` to disable hybrid inference; behavior is the same as vLLM. |
 | `LVLLM_MOE_USE_WEIGHT` | Performance Parameter | `INT4` | Runtime expert weight format: `TO_DTYPE` (model dtype), `KEEP` (original model weight format), `INT4`/`INT8` (quantized). |  |
+| `LVLLM_HW_AWARE_TUNING` | Performance Parameter | `1` | Enable hardware-aware auto recommendations for `LK_THREADS`, `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE`, and `LVLLM_GPU_PREFETCH_WINDOW` when they are not explicitly set. | Set to `0` to fully use manual env values; set to `1` to reduce trial-and-error tuning. |
 | `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU Prefill Parameter | `None` | MoE layers resident on GPU. Examples: `0`, `0-1`, `0,9`. | After reserving KV cache memory, more resident layers can improve performance and reduce CPU memory pressure. |
-| `LVLLM_GPU_PREFETCH_WINDOW` | GPU Prefill Parameter | `3` | Prefetch window size for MoE expert layers, e.g. `1` means prefetch 1 layer. | In most cases, `1` to `2` is enough. |
-| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU Prefill Parameter | `0` | Minimum token count to enable GPU prefill. `0` disables GPU prefill. | Set this based on workload characteristics; too small can hurt throughput. |
+| `LVLLM_GPU_PREFETCH_WINDOW` | GPU Prefill Parameter | `auto` | Prefetch window size for MoE expert layers. If unset, the effective value is hardware-aware. | Most workloads are optimal in `1`~`2`. Explicit env value always takes precedence. |
+| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU Prefill Parameter | `auto` | Minimum token count to enable GPU prefill. If unset, the effective value is hardware-aware. | Set `0` to force-disable GPU prefill. Explicit env value always takes precedence. |
 | `LVLLM_ENABLE_NUMA_INTERLEAVE` | Performance Parameter | `0` | `0`: faster model load, `1`: slower load with lower OOM risk. | Use `0` when memory is sufficient; use `1` when memory is tight. |
 | `LVLLM_NUMA_BIND_STRATEGY` | Performance Parameter | `gpu_local` | NUMA binding strategy for worker processes: `gpu_local` or `interleave`. |  |
 | `LVLLM_NUMACTL_ARGS_OVERRIDE` | Performance Parameter | `None` | Explicit `numactl` arguments override, e.g. `--cpunodebind=0 --membind=0`. |  |

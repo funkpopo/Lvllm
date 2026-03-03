@@ -130,6 +130,7 @@ def test_validate_lvllm_config_contract_defaults(monkeypatch: pytest.MonkeyPatch
         "LVLLM_NUMA_BIND_STRATEGY",
         "LVLLM_NUMACTL_ARGS_OVERRIDE",
         "LVLLM_MOE_QUANT_ON_GPU",
+        "LVLLM_HW_AWARE_TUNING",
         "LVLLM_MOE_USE_WEIGHT",
         "LVLLM_GPU_RESIDENT_MOE_LAYERS",
         "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE",
@@ -142,6 +143,76 @@ def test_validate_lvllm_config_contract_defaults(monkeypatch: pytest.MonkeyPatch
     assert snapshot["LVLLM_GPU_PREFETCH_WINDOW"] == 3
     assert snapshot["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"] == 0
     assert snapshot["LVLLM_GPU_PREFILL_ENABLED"] is False
+
+
+def test_validate_lvllm_config_contract_uses_hardware_recommendation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    disable_envs_cache()
+    monkeypatch.setenv("LVLLM_MOE_NUMA_ENABLED", "1")
+    monkeypatch.setenv("LVLLM_HW_AWARE_TUNING", "1")
+    monkeypatch.delenv("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE", raising=False)
+    monkeypatch.delenv("LVLLM_GPU_PREFETCH_WINDOW", raising=False)
+
+    monkeypatch.setattr(envs, "is_lk_moe_feature_enabled", lambda: True)
+    monkeypatch.setattr(
+        envs,
+        "get_lvllm_hardware_recommendations",
+        lambda *args, **kwargs: {
+            "LK_THREADS": 44,
+            "OMP_NUM_THREADS": 44,
+            "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE": 2048,
+            "LVLLM_GPU_PREFETCH_WINDOW": 1,
+            "GPU_COUNT": 2,
+            "GPU_MIN_MEMORY_GB": 24,
+            "GPU_MIN_COMPUTE_CAPABILITY": 89,
+            "CPU_LOGICAL_CORES": 192,
+            "CPU_PHYSICAL_CORES": 96,
+            "WORKER_PROCESSES": 2,
+        },
+    )
+
+    snapshot = envs.validate_lvllm_config_contract(hard_fail=True, log_snapshot=False)
+    assert snapshot["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"] == 2048
+    assert snapshot["LVLLM_GPU_PREFETCH_WINDOW"] == 1
+    assert snapshot["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE_SOURCE"] == "hardware_aware"
+    assert snapshot["LVLLM_GPU_PREFETCH_WINDOW_SOURCE"] == "hardware_aware"
+    assert snapshot["LK_THREADS_RECOMMENDED"] == 44
+    assert snapshot["OMP_NUM_THREADS_RECOMMENDED"] == 44
+
+
+def test_validate_lvllm_config_contract_prefers_explicit_values(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    disable_envs_cache()
+    monkeypatch.setenv("LVLLM_MOE_NUMA_ENABLED", "1")
+    monkeypatch.setenv("LVLLM_HW_AWARE_TUNING", "1")
+    monkeypatch.setenv("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE", "1024")
+    monkeypatch.setenv("LVLLM_GPU_PREFETCH_WINDOW", "2")
+
+    monkeypatch.setattr(envs, "is_lk_moe_feature_enabled", lambda: True)
+    monkeypatch.setattr(
+        envs,
+        "get_lvllm_hardware_recommendations",
+        lambda *args, **kwargs: {
+            "LK_THREADS": 32,
+            "OMP_NUM_THREADS": 32,
+            "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE": 2048,
+            "LVLLM_GPU_PREFETCH_WINDOW": 1,
+            "GPU_COUNT": 1,
+            "GPU_MIN_MEMORY_GB": 24,
+            "GPU_MIN_COMPUTE_CAPABILITY": 89,
+            "CPU_LOGICAL_CORES": 64,
+            "CPU_PHYSICAL_CORES": 32,
+            "WORKER_PROCESSES": 1,
+        },
+    )
+
+    snapshot = envs.validate_lvllm_config_contract(hard_fail=True, log_snapshot=False)
+    assert snapshot["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"] == 1024
+    assert snapshot["LVLLM_GPU_PREFETCH_WINDOW"] == 2
+    assert snapshot["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE_SOURCE"] == "env"
+    assert snapshot["LVLLM_GPU_PREFETCH_WINDOW_SOURCE"] == "env"
 
 
 def test_validate_lvllm_config_contract_rejects_invalid_strategy(
@@ -205,6 +276,18 @@ def test_validate_lvllm_config_contract_requires_interleave_for_numactl_override
 def test_lvllm_readme_env_table_is_synced():
     repo_root = Path(__file__).resolve().parents[1]
     script = repo_root / "scripts" / "sync_lvllm_readme_env_table.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--check"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_lvllm_readme_support_matrix_is_synced():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "sync_lvllm_readme_support_matrix.py"
     result = subprocess.run(
         [sys.executable, str(script), "--check"],
         cwd=repo_root,

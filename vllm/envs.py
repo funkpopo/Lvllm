@@ -5,6 +5,7 @@ import functools
 import json
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -223,6 +224,7 @@ if TYPE_CHECKING:
     LVLLM_NUMA_BIND_STRATEGY: Literal["gpu_local", "interleave"] = "gpu_local"
     LVLLM_NUMACTL_ARGS_OVERRIDE: str | None = None
     LVLLM_MOE_QUANT_ON_GPU: bool = False
+    LVLLM_HW_AWARE_TUNING: bool = True
     LVLLM_MOE_USE_WEIGHT: Literal["KEEP", "TO_DTYPE", "INT4", "INT8"] = "INT4"
     LVLLM_GPU_RESIDENT_MOE_LAYERS: str | None = None
     LVLLM_GPU_PREFILL_MIN_BATCH_SIZE: int = 0
@@ -476,6 +478,7 @@ LVLLM_MOE_NUMA_ENABLED_DEFAULT = False
 LVLLM_ENABLE_NUMA_INTERLEAVE_DEFAULT = False
 LVLLM_NUMA_BIND_STRATEGY_DEFAULT = "gpu_local"
 LVLLM_MOE_QUANT_ON_GPU_DEFAULT = False
+LVLLM_HW_AWARE_TUNING_DEFAULT = True
 LVLLM_MOE_USE_WEIGHT_DEFAULT = "INT4"
 LVLLM_MOE_USE_WEIGHT_CHOICES = ("KEEP", "TO_DTYPE", "INT4", "INT8")
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE_DEFAULT = 0
@@ -529,6 +532,26 @@ LVLLM_README_DOC_ROWS: tuple[LvllmEnvDocRow, ...] = (
         ),
     ),
     LvllmEnvDocRow(
+        name="LVLLM_HW_AWARE_TUNING",
+        category_en="Performance Parameter",
+        category_zh="性能参数",
+        default=_bool_to_env(LVLLM_HW_AWARE_TUNING_DEFAULT),
+        description_en=(
+            "Enable hardware-aware auto recommendations for `LK_THREADS`, "
+            "`LVLLM_GPU_PREFILL_MIN_BATCH_SIZE`, and `LVLLM_GPU_PREFETCH_WINDOW` "
+            "when they are not explicitly set."
+        ),
+        description_zh=(
+            "启用硬件感知自动推荐。在未显式设置时，自动推荐 `LK_THREADS`、"
+            "`LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` 和 `LVLLM_GPU_PREFETCH_WINDOW`。"
+        ),
+        notes_en=(
+            "Set to `0` to fully use manual env values; set to `1` to reduce "
+            "trial-and-error tuning."
+        ),
+        notes_zh="设为 `0` 完全使用手工参数，设为 `1` 可减少反复试错调参。",
+    ),
+    LvllmEnvDocRow(
         name="LVLLM_GPU_RESIDENT_MOE_LAYERS",
         category_en="GPU Prefill Parameter",
         category_zh="GPU预填充参数",
@@ -549,25 +572,33 @@ LVLLM_README_DOC_ROWS: tuple[LvllmEnvDocRow, ...] = (
         name="LVLLM_GPU_PREFETCH_WINDOW",
         category_en="GPU Prefill Parameter",
         category_zh="GPU预填充参数",
-        default=str(LVLLM_GPU_PREFETCH_WINDOW_DEFAULT),
+        default="auto",
         description_en=(
-            "Prefetch window size for MoE expert layers, e.g. `1` means prefetch 1 layer."
+            "Prefetch window size for MoE expert layers. If unset, the effective "
+            "value is hardware-aware."
         ),
-        description_zh="MoE 专家层预取窗口大小，例如 `1` 表示预取 1 层。",
-        notes_en="In most cases, `1` to `2` is enough.",
-        notes_zh="通常设置 `1` 到 `2` 即可。",
+        description_zh="MoE 专家层预取窗口大小。未设置时将使用硬件感知推荐值。",
+        notes_en=(
+            "Most workloads are optimal in `1`~`2`. Explicit env value always "
+            "takes precedence."
+        ),
+        notes_zh="多数负载 `1`~`2` 即可；显式设置环境变量会覆盖自动推荐。",
     ),
     LvllmEnvDocRow(
         name="LVLLM_GPU_PREFILL_MIN_BATCH_SIZE",
         category_en="GPU Prefill Parameter",
         category_zh="GPU预填充参数",
-        default=str(LVLLM_GPU_PREFILL_MIN_BATCH_SIZE_DEFAULT),
+        default="auto",
         description_en=(
-            "Minimum token count to enable GPU prefill. `0` disables GPU prefill."
+            "Minimum token count to enable GPU prefill. If unset, the effective "
+            "value is hardware-aware."
         ),
-        description_zh="启用 GPU prefill 的最小 token 数。`0` 表示关闭 GPU prefill。",
-        notes_en="Set this based on workload characteristics; too small can hurt throughput.",
-        notes_zh="应按负载特征配置，设置过小可能影响吞吐。",
+        description_zh="启用 GPU prefill 的最小 token 数。未设置时将使用硬件感知推荐值。",
+        notes_en=(
+            "Set `0` to force-disable GPU prefill. Explicit env value always "
+            "takes precedence."
+        ),
+        notes_zh="设为 `0` 可强制关闭 GPU prefill；显式环境变量始终优先生效。",
     ),
     LvllmEnvDocRow(
         name="LVLLM_ENABLE_NUMA_INTERLEAVE",
@@ -1747,6 +1778,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
             )
         )
     ),
+    # Whether to enable hardware-aware tuning recommendations.
+    "LVLLM_HW_AWARE_TUNING": lambda: bool(
+        int(
+            os.getenv(
+                "LVLLM_HW_AWARE_TUNING",
+                _bool_to_env(LVLLM_HW_AWARE_TUNING_DEFAULT),
+            )
+        )
+    ),
     # Weight format for MOE.
     "LVLLM_MOE_USE_WEIGHT": env_with_choices(
         "LVLLM_MOE_USE_WEIGHT",
@@ -1871,6 +1911,7 @@ def disable_envs_cache() -> None:
     if _is_envs_cache_enabled():
         assert hasattr(__getattr__, "__wrapped__")
         __getattr__ = __getattr__.__wrapped__
+    _clear_lvllm_hw_recommendation_cache()
 
 
 def __dir__():
@@ -1971,6 +2012,7 @@ def compile_factors() -> dict[str, object]:
         "LVLLM_NUMA_BIND_STRATEGY",
         "LVLLM_NUMACTL_ARGS_OVERRIDE",
         "LVLLM_MOE_QUANT_ON_GPU",
+        "LVLLM_HW_AWARE_TUNING",
     }
 
     from vllm.config.utils import normalize_value
@@ -2021,6 +2063,266 @@ def compile_factors() -> dict[str, object]:
 
 _is_in_profile_run = True
 _lvllm_snapshot_logged = False
+_lvllm_hw_recommendation_cache: dict[str, int | None] | None = None
+
+
+@dataclass(frozen=True)
+class LvllmHardwareFacts:
+    logical_cpu_count: int
+    physical_cpu_count: int
+    gpu_count: int
+    min_gpu_memory_gb: int
+    min_gpu_compute_capability: int | None
+    worker_processes: int
+
+
+def _clear_lvllm_hw_recommendation_cache() -> None:
+    global _lvllm_hw_recommendation_cache
+    _lvllm_hw_recommendation_cache = None
+
+
+def _is_env_explicitly_set(name: str) -> bool:
+    return name in os.environ
+
+
+def is_lvllm_hw_aware_tuning_enabled() -> bool:
+    return bool(environment_variables["LVLLM_HW_AWARE_TUNING"]())
+
+
+def _parse_positive_int_from_env(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _infer_lk_worker_processes(*, local_world_size: int | None = None) -> int:
+    if local_world_size is not None and local_world_size > 0:
+        return local_world_size
+
+    for env_name in (
+        "LOCAL_WORLD_SIZE",
+        "VLLM_LOCAL_WORLD_SIZE",
+        "WORLD_SIZE",
+        "VLLM_TENSOR_PARALLEL_SIZE",
+        "TENSOR_PARALLEL_SIZE",
+    ):
+        value = _parse_positive_int_from_env(env_name)
+        if value is not None:
+            return value
+
+    visible_devices = os.getenv("CUDA_VISIBLE_DEVICES")
+    if visible_devices is not None:
+        device_tokens = [token.strip() for token in visible_devices.split(",")]
+        filtered_tokens = [
+            token for token in device_tokens if token and token.lower() != "none"
+        ]
+        if filtered_tokens:
+            return len(filtered_tokens)
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            count = int(torch.cuda.device_count())
+            if count > 0:
+                return count
+    except Exception:
+        pass
+
+    return 1
+
+
+def _get_logical_cpu_count() -> int:
+    if hasattr(os, "sched_getaffinity"):
+        return max(1, len(os.sched_getaffinity(0)))
+    return max(1, os.cpu_count() or 1)
+
+
+def _get_physical_cpu_count(logical_cpu_count: int) -> int:
+    try:
+        import psutil
+
+        physical = psutil.cpu_count(logical=False)
+        if physical is not None and physical > 0:
+            return int(physical)
+    except Exception:
+        pass
+
+    if sys.platform.startswith("linux"):
+        try:
+            output = subprocess.check_output(
+                ["lscpu", "-p=CORE,SOCKET"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            core_socket_pairs: set[tuple[int, int]] = set()
+            for line in output.splitlines():
+                if not line or line.startswith("#"):
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 2:
+                    continue
+                if not (parts[0].isdigit() and parts[1].isdigit()):
+                    continue
+                core_socket_pairs.add((int(parts[0]), int(parts[1])))
+            if core_socket_pairs:
+                return len(core_socket_pairs)
+        except Exception:
+            pass
+
+    return max(1, logical_cpu_count // 2)
+
+
+def _get_gpu_hardware_facts() -> tuple[int, int, int | None]:
+    gpu_count = 0
+    min_gpu_memory_gb = 0
+    min_gpu_compute_capability: int | None = None
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            gpu_count = int(torch.cuda.device_count())
+            memory_values: list[int] = []
+            compute_caps: list[int] = []
+            for device_idx in range(gpu_count):
+                props = torch.cuda.get_device_properties(device_idx)
+                memory_values.append(int(props.total_memory // (1024**3)))
+                compute_caps.append(int(props.major) * 10 + int(props.minor))
+            if memory_values:
+                min_gpu_memory_gb = min(memory_values)
+            if compute_caps:
+                min_gpu_compute_capability = min(compute_caps)
+    except Exception:
+        pass
+
+    if gpu_count == 0:
+        visible_devices = os.getenv("CUDA_VISIBLE_DEVICES")
+        if visible_devices is not None:
+            device_tokens = [token.strip() for token in visible_devices.split(",")]
+            filtered_tokens = [
+                token for token in device_tokens if token and token.lower() != "none"
+            ]
+            gpu_count = len(filtered_tokens)
+
+    return gpu_count, min_gpu_memory_gb, min_gpu_compute_capability
+
+
+def _collect_lvllm_hardware_facts(
+    *, local_world_size: int | None = None
+) -> LvllmHardwareFacts:
+    logical_cpu_count = _get_logical_cpu_count()
+    physical_cpu_count = _get_physical_cpu_count(logical_cpu_count)
+    gpu_count, min_gpu_memory_gb, min_gpu_compute_capability = _get_gpu_hardware_facts()
+    worker_processes = _infer_lk_worker_processes(local_world_size=local_world_size)
+    return LvllmHardwareFacts(
+        logical_cpu_count=logical_cpu_count,
+        physical_cpu_count=physical_cpu_count,
+        gpu_count=gpu_count,
+        min_gpu_memory_gb=min_gpu_memory_gb,
+        min_gpu_compute_capability=min_gpu_compute_capability,
+        worker_processes=max(1, worker_processes),
+    )
+
+
+def _recommend_lk_threads(facts: LvllmHardwareFacts) -> int:
+    reserve_threads = max(4, min(16, facts.physical_cpu_count // 12))
+    usable_threads = max(1, facts.physical_cpu_count - reserve_threads)
+    return max(1, usable_threads // max(1, facts.worker_processes))
+
+
+def _recommend_gpu_prefill_min_batch_size(facts: LvllmHardwareFacts) -> int:
+    if facts.gpu_count <= 0:
+        return 0
+
+    if facts.min_gpu_memory_gb < 20:
+        return 0
+
+    if (
+        facts.min_gpu_compute_capability is not None
+        and facts.min_gpu_compute_capability >= 90
+    ):
+        return 2048
+
+    return 4096
+
+
+def _recommend_gpu_prefetch_window(
+    facts: LvllmHardwareFacts, prefill_min_batch_size: int
+) -> int:
+    if prefill_min_batch_size <= 0:
+        return 0
+
+    if (
+        facts.min_gpu_compute_capability is not None
+        and facts.min_gpu_compute_capability >= 100
+    ):
+        return 2
+
+    if facts.gpu_count >= 4 and facts.min_gpu_memory_gb >= 40:
+        return 2
+
+    return 1
+
+
+def get_lvllm_hardware_recommendations(
+    *, local_world_size: int | None = None, refresh: bool = False
+) -> dict[str, int | None]:
+    global _lvllm_hw_recommendation_cache
+
+    use_cache = local_world_size is None and not refresh
+    if use_cache and _lvllm_hw_recommendation_cache is not None:
+        return dict(_lvllm_hw_recommendation_cache)
+
+    facts = _collect_lvllm_hardware_facts(local_world_size=local_world_size)
+    lk_threads = _recommend_lk_threads(facts)
+    gpu_prefill_min_batch_size = _recommend_gpu_prefill_min_batch_size(facts)
+    gpu_prefetch_window = _recommend_gpu_prefetch_window(
+        facts,
+        gpu_prefill_min_batch_size,
+    )
+
+    recommendations: dict[str, int | None] = {
+        "LK_THREADS": lk_threads,
+        "OMP_NUM_THREADS": lk_threads,
+        "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE": gpu_prefill_min_batch_size,
+        "LVLLM_GPU_PREFETCH_WINDOW": gpu_prefetch_window,
+        "GPU_COUNT": facts.gpu_count,
+        "GPU_MIN_MEMORY_GB": facts.min_gpu_memory_gb,
+        "GPU_MIN_COMPUTE_CAPABILITY": facts.min_gpu_compute_capability,
+        "CPU_LOGICAL_CORES": facts.logical_cpu_count,
+        "CPU_PHYSICAL_CORES": facts.physical_cpu_count,
+        "WORKER_PROCESSES": facts.worker_processes,
+    }
+
+    if use_cache:
+        _lvllm_hw_recommendation_cache = dict(recommendations)
+
+    return recommendations
+
+
+def _use_hardware_recommendation_for(name: str) -> bool:
+    if not is_lvllm_hw_aware_tuning_enabled():
+        return False
+    if _is_env_explicitly_set(name):
+        return False
+    return is_lk_moe_feature_enabled()
+
+
+def get_recommended_lk_threads(*, local_world_size: int | None = None) -> int:
+    value = get_lvllm_hardware_recommendations(local_world_size=local_world_size)[
+        "LK_THREADS"
+    ]
+    assert value is not None
+    return int(value)
 
 
 def _parse_lk_moe_gpu_resident_layer_plan(
@@ -2082,10 +2384,20 @@ def is_lk_moe_gpu_resident_layer_idx(layer_idx: int) -> bool:
 
 
 def get_gpu_prefill_min_batch_size() -> int:
+    if _use_hardware_recommendation_for("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"):
+        value = get_lvllm_hardware_recommendations()[
+            "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"
+        ]
+        assert value is not None
+        return int(value)
     return environment_variables["LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"]()
 
 
 def get_gpu_prefetch_window() -> int:
+    if _use_hardware_recommendation_for("LVLLM_GPU_PREFETCH_WINDOW"):
+        value = get_lvllm_hardware_recommendations()["LVLLM_GPU_PREFETCH_WINDOW"]
+        assert value is not None
+        return int(value)
     return environment_variables["LVLLM_GPU_PREFETCH_WINDOW"]()
 
 
@@ -2094,9 +2406,15 @@ def get_moe_compute_strategy() -> MoeComputeStrategy:
     return MoeComputeStrategy(value)
 
 
+def _get_lvllm_value_source(name: str) -> str:
+    return "hardware_aware" if _use_hardware_recommendation_for(name) else "env"
+
+
 def get_lvllm_config_snapshot(*, strict: bool = True) -> dict[str, Any]:
     resident_layers = sorted(get_lk_moe_gpu_resident_layer_plan(strict=strict))
     prefill_min_batch_size = get_gpu_prefill_min_batch_size()
+    prefetch_window = get_gpu_prefetch_window()
+    recommendations = get_lvllm_hardware_recommendations()
 
     return {
         "LVLLM_MOE_NUMA_ENABLED": bool(
@@ -2108,13 +2426,36 @@ def get_lvllm_config_snapshot(*, strict: bool = True) -> dict[str, Any]:
         "LVLLM_NUMA_BIND_STRATEGY": get_numa_bind_strategy(),
         "LVLLM_NUMACTL_ARGS_OVERRIDE": get_numa_numactl_args_override(),
         "LVLLM_MOE_QUANT_ON_GPU": is_lk_moe_quant_on_gpu(),
+        "LVLLM_HW_AWARE_TUNING": is_lvllm_hw_aware_tuning_enabled(),
         "LVLLM_MOE_USE_WEIGHT": get_moe_compute_strategy().value,
         "LVLLM_GPU_RESIDENT_MOE_LAYERS": environment_variables[
             "LVLLM_GPU_RESIDENT_MOE_LAYERS"
         ](),
         "LVLLM_GPU_RESIDENT_LAYER_PLAN": resident_layers,
         "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE": prefill_min_batch_size,
-        "LVLLM_GPU_PREFETCH_WINDOW": get_gpu_prefetch_window(),
+        "LVLLM_GPU_PREFETCH_WINDOW": prefetch_window,
+        "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE_SOURCE": _get_lvllm_value_source(
+            "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"
+        ),
+        "LVLLM_GPU_PREFETCH_WINDOW_SOURCE": _get_lvllm_value_source(
+            "LVLLM_GPU_PREFETCH_WINDOW"
+        ),
+        "LK_THREADS_RECOMMENDED": recommendations["LK_THREADS"],
+        "OMP_NUM_THREADS_RECOMMENDED": recommendations["OMP_NUM_THREADS"],
+        "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE_RECOMMENDED": recommendations[
+            "LVLLM_GPU_PREFILL_MIN_BATCH_SIZE"
+        ],
+        "LVLLM_GPU_PREFETCH_WINDOW_RECOMMENDED": recommendations[
+            "LVLLM_GPU_PREFETCH_WINDOW"
+        ],
+        "LVLLM_HW_GPU_COUNT": recommendations["GPU_COUNT"],
+        "LVLLM_HW_GPU_MIN_MEMORY_GB": recommendations["GPU_MIN_MEMORY_GB"],
+        "LVLLM_HW_GPU_MIN_COMPUTE_CAPABILITY": recommendations[
+            "GPU_MIN_COMPUTE_CAPABILITY"
+        ],
+        "LVLLM_HW_CPU_LOGICAL_CORES": recommendations["CPU_LOGICAL_CORES"],
+        "LVLLM_HW_CPU_PHYSICAL_CORES": recommendations["CPU_PHYSICAL_CORES"],
+        "LVLLM_HW_WORKER_PROCESSES": recommendations["WORKER_PROCESSES"],
         "LVLLM_GPU_PREFILL_ENABLED": prefill_min_batch_size > 0,
     }
 

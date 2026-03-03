@@ -352,15 +352,16 @@ vllm serve \
 | 环境变量 | 类型 | 默认值 | 说明 | 备注 |
 |--------|------|--------|------|------|
 | `LK_THREAD_BINDING` | 性能参数 | `CPU_CORE` | 线程绑定策略: `CPU_CORE`-按CPU核心绑定，`NUMA_NODE`-按NUMA节点绑定 | 默认按CPU核心绑定, 遇到性能问题时可尝试按NUMA节点绑定 |
-| `LK_THREADS` | 性能参数 | 自动计算 | 线程数量: 物理核心数-4 | 多GPU多进程时，物理核心数-4除以进程数量 |
-| `OMP_NUM_THREADS` | 性能参数 | 系统逻辑核心数量 | OpenMP线程数: 设置为`LK_THREADS`相同 |   | 
+| `LK_THREADS` | 性能参数 | 硬件感知自动推荐 | 按物理核心数与工作进程数计算每个 worker 建议线程数 | 显式设置 `LK_THREADS` 会覆盖自动推荐 |
+| `OMP_NUM_THREADS` | 性能参数 | 未设置时跟随 `LK_THREADS` | worker 侧 OpenMP 线程数 | 显式设置 `OMP_NUM_THREADS` 会覆盖自动推荐 | 
 | `LK_POWER_SAVING` | cpu节能 | 0 | `1`：启用cpu节能模式，`0`：禁用cpu节能模式 | 建议值：`0` |
 <!-- BEGIN_LVLLM_ENV_TABLE -->
 | `LVLLM_MOE_NUMA_ENABLED` | 核心参数 | `0` | 是否启用混合推理：`1`-启用，`0`-禁用。 | 设置为`0`禁用混合推理，行为与 vLLM 相同。 |
 | `LVLLM_MOE_USE_WEIGHT` | 性能参数 | `INT4` | 运行时专家权重格式：`TO_DTYPE`（模型 dtype）、`KEEP`（保持模型原始格式）、`INT4`/`INT8`（量化权重）。 |  |
+| `LVLLM_HW_AWARE_TUNING` | 性能参数 | `1` | 启用硬件感知自动推荐。在未显式设置时，自动推荐 `LK_THREADS`、`LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` 和 `LVLLM_GPU_PREFETCH_WINDOW`。 | 设为 `0` 完全使用手工参数，设为 `1` 可减少反复试错调参。 |
 | `LVLLM_GPU_RESIDENT_MOE_LAYERS` | GPU预填充参数 | `None` | 常驻 GPU 的 MoE 层。示例：`0`、`0-1`、`0,9`。 | 在预留 KV Cache 显存后，增加常驻层可提升性能并降低对应内存压力。 |
-| `LVLLM_GPU_PREFETCH_WINDOW` | GPU预填充参数 | `3` | MoE 专家层预取窗口大小，例如 `1` 表示预取 1 层。 | 通常设置 `1` 到 `2` 即可。 |
-| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU预填充参数 | `0` | 启用 GPU prefill 的最小 token 数。`0` 表示关闭 GPU prefill。 | 应按负载特征配置，设置过小可能影响吞吐。 |
+| `LVLLM_GPU_PREFETCH_WINDOW` | GPU预填充参数 | `auto` | MoE 专家层预取窗口大小。未设置时将使用硬件感知推荐值。 | 多数负载 `1`~`2` 即可；显式设置环境变量会覆盖自动推荐。 |
+| `LVLLM_GPU_PREFILL_MIN_BATCH_SIZE` | GPU预填充参数 | `auto` | 启用 GPU prefill 的最小 token 数。未设置时将使用硬件感知推荐值。 | 设为 `0` 可强制关闭 GPU prefill；显式环境变量始终优先生效。 |
 | `LVLLM_ENABLE_NUMA_INTERLEAVE` | 性能参数 | `0` | `0`：更快加载模型，`1`：更慢加载但可降低 OOM 风险。 | 内存充足建议 `0`，内存紧张建议 `1`。 |
 | `LVLLM_NUMA_BIND_STRATEGY` | 性能参数 | `gpu_local` | Worker 进程 NUMA 绑定策略：`gpu_local` 或 `interleave`。 |  |
 | `LVLLM_NUMACTL_ARGS_OVERRIDE` | 性能参数 | `None` | 显式 `numactl` 参数覆盖，例如 `--cpunodebind=0 --membind=0`。 |  |
