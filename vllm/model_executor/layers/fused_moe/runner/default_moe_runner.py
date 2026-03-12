@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
@@ -7,6 +8,13 @@ import torch
 import torch.nn.functional as F
 
 import vllm.envs as envs
+from vllm.envs import (
+    get_gpu_prefetch_window,
+    get_gpu_prefill_min_batch_size,
+    is_lk_moe_gpu_resident_layer,
+    is_lk_moe_quant_on_gpu,
+    is_lk_moe_use_gpu_prefill,
+)
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
@@ -30,6 +38,7 @@ from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import (
     HAS_OPAQUE_TYPE,
     ModuleName,
@@ -40,8 +49,8 @@ from vllm.utils.torch_utils import (
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 logger = init_logger(__name__)
-from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.envs import is_lk_moe_gpu_resident_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill, is_lk_moe_quant_on_gpu
+
+
 def get_layer_from_name(layer_name: str) -> torch.nn.Module:
     forward_context: ForwardContext = get_forward_context()
     if layer_name == "from_forward_context":
@@ -71,6 +80,56 @@ else:
 
 def _resolve_layer_name(layer_name: str | ModuleName) -> str:
     return layer_name.value if isinstance(layer_name, ModuleName) else layer_name
+
+
+LVLLM_MOE_REQUEST_BATCH_CTX_KEY = "lvllm_moe_request_batch"
+_LVLLM_MOE_PATH_LOG_STATE_CTX_KEY = "_lvllm_moe_path_log_state"
+
+
+def _get_lvllm_request_batch() -> tuple[tuple[str, int], ...]:
+    if not is_forward_context_available():
+        return ()
+
+    request_batch = get_forward_context().additional_kwargs.get(
+        LVLLM_MOE_REQUEST_BATCH_CTX_KEY, ()
+    )
+    return tuple((str(req_id), int(num_tokens)) for req_id, num_tokens in request_batch)
+
+
+def _format_lvllm_request_batch(request_batch: tuple[tuple[str, int], ...]) -> str:
+    return ", ".join(f"{req_id}({num_tokens})" for req_id, num_tokens in request_batch)
+
+
+def _maybe_log_moe_path_hit(layer_name: str, path: str, num_tokens: int) -> None:
+    if not logger.isEnabledFor(logging.DEBUG) or not is_forward_context_available():
+        return
+
+    forward_context = get_forward_context()
+    request_batch = _get_lvllm_request_batch()
+    log_state = forward_context.additional_kwargs.setdefault(
+        _LVLLM_MOE_PATH_LOG_STATE_CTX_KEY, set()
+    )
+    log_key = (layer_name, path, request_batch)
+    if log_key in log_state:
+        return
+    log_state.add(log_key)
+
+    if request_batch:
+        logger.debug(
+            "LvLLM MoE path hit: layer=%s path=%s requests=%s total_tokens=%d",
+            layer_name,
+            path,
+            _format_lvllm_request_batch(request_batch),
+            num_tokens,
+        )
+        return
+
+    logger.debug(
+        "LvLLM MoE path hit: layer=%s path=%s total_tokens=%d",
+        layer_name,
+        path,
+        num_tokens,
+    )
 
 
 def _moe_forward(
@@ -514,10 +573,18 @@ class DefaultMoERunner(MoERunner):
                 shared_input if shared_input is not None else staged_hidden_states
             )
 
+            use_gpu_prefill = layer.should_use_gpu_prefill(hidden_states)
+            moe_path = (
+                "gpu_resident"
+                if layer.is_gpu_resident_layer
+                else "gpu_prefill" if use_gpu_prefill else "cpu"
+            )
+            _maybe_log_moe_path_hit(layer.layer_name, moe_path, hidden_states.size(0))
+
             # Matrix multiply.
             if self.quant_method.is_monolithic:
                 assert has_separate_shared_experts or self.shared_experts is None
-                if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
+                if not layer.is_gpu_resident_layer and not use_gpu_prefill:
                     topk_weights, topk_ids = self.router.select_experts(
                         hidden_states=staged_hidden_states,
                         router_logits=staged_router_logits,
@@ -529,7 +596,7 @@ class DefaultMoERunner(MoERunner):
                         local_topk_ids
                     )
                 else:
-                    if self.is_gpu_prefill_layer:
+                    if use_gpu_prefill:
                         from vllm.model_executor.layers.quantization.gguf import fused_moe_gguf
                         topk_weights, topk_ids = self.router.select_experts(
                             hidden_states=staged_hidden_states,
@@ -557,14 +624,15 @@ class DefaultMoERunner(MoERunner):
                     hidden_states=staged_hidden_states,
                     router_logits=staged_router_logits,
                 )
-                if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
+                if not layer.is_gpu_resident_layer and not use_gpu_prefill:
+                    local_topk_ids = layer.global_to_local_expert_ids(topk_ids) if layer.use_ep else topk_ids
                     final_hidden_states = layer.forward_lk(
                         staged_hidden_states,
                         topk_weights, 
                         local_topk_ids
                     )
                 else:
-                    if self.is_gpu_prefill_layer:
+                    if use_gpu_prefill:
                         from vllm.model_executor.layers.quantization.gguf import fused_moe_gguf
                         local_topk_ids = layer.global_to_local_expert_ids(topk_ids) if layer.use_ep else topk_ids
                         final_hidden_states = fused_moe_gguf(
@@ -735,9 +803,17 @@ class DefaultMoERunner(MoERunner):
                     dim=0,
                 )
 
+            use_gpu_prefill = layer.should_use_gpu_prefill(hidden_states)
+            moe_path = (
+                "gpu_resident"
+                if layer.is_gpu_resident_layer
+                else "gpu_prefill" if use_gpu_prefill else "cpu"
+            )
+            _maybe_log_moe_path_hit(layer.layer_name, moe_path, hidden_states.size(0))
+
             # Matrix multiply.
             if self.quant_method.is_monolithic:
-                if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
+                if not layer.is_gpu_resident_layer and not use_gpu_prefill:
                     topk_weights, topk_ids = self.router.select_experts(
                         hidden_states=hidden_states,
                         router_logits=router_logits,
@@ -749,7 +825,7 @@ class DefaultMoERunner(MoERunner):
                         local_topk_ids  
                     )
                 else:
-                    if layer.is_gpu_prefill_layer:
+                    if use_gpu_prefill:
                         from vllm.model_executor.layers.quantization.gguf import fused_moe_gguf
                         topk_weights, topk_ids = self.router.select_experts(
                             hidden_states=hidden_states,
@@ -777,7 +853,7 @@ class DefaultMoERunner(MoERunner):
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                 )
-                if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
+                if not layer.is_gpu_resident_layer and not use_gpu_prefill:
                     local_topk_ids = layer.global_to_local_expert_ids(topk_ids) if layer.use_ep else topk_ids
                     final_hidden_states = layer.forward_lk( 
                         hidden_states,
@@ -785,7 +861,7 @@ class DefaultMoERunner(MoERunner):
                         local_topk_ids  
                     )
                 else:    
-                    if layer.is_gpu_prefill_layer:
+                    if use_gpu_prefill:
                         from vllm.model_executor.layers.quantization.gguf import fused_moe_gguf
                         local_topk_ids = layer.global_to_local_expert_ids(topk_ids) if layer.use_ep else topk_ids
                         final_hidden_states = fused_moe_gguf(

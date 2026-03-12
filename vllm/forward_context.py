@@ -321,6 +321,7 @@ def set_forward_context(
     ubatch_slices: UBatchSlices | None = None,
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
+    additional_kwargs: dict[str, Any] | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -359,7 +360,7 @@ def set_forward_context(
     if cudagraph_runtime_mode != CUDAGraphMode.NONE and num_tokens is not None:
         batch_descriptor = batch_descriptor or BatchDescriptor(num_tokens=num_tokens)
 
-    additional_kwargs = current_platform.set_additional_forward_context(
+    platform_additional_kwargs = current_platform.set_additional_forward_context(
         attn_metadata=attn_metadata,
         vllm_config=vllm_config,
         virtual_engine=virtual_engine,
@@ -370,6 +371,11 @@ def set_forward_context(
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
     )
+    if additional_kwargs:
+        platform_additional_kwargs = {
+            **platform_additional_kwargs,
+            **additional_kwargs,
+        }
 
     forward_context = create_forward_context(
         attn_metadata,
@@ -380,7 +386,7 @@ def set_forward_context(
         batch_descriptor,
         ubatch_slices,
         slot_mapping,
-        additional_kwargs,
+        platform_additional_kwargs,
         skip_compiled,
     )
 

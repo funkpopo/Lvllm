@@ -980,6 +980,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_tokens=input_batch.num_tokens_after_padding,
                 has_lora=self.lora_config is not None,
             )
+            lvllm_moe_request_batch = tuple(
+                (req_id, int(num_tokens))
+                for req_id, num_tokens in zip(
+                    input_batch.req_ids, input_batch.num_scheduled_tokens.tolist()
+                )
+            )
 
             with set_forward_context(
                 attn_metadata,
@@ -989,6 +995,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_tokens_across_dp=num_tokens_across_dp,
                 batch_descriptor=batch_descriptor,
                 slot_mapping=slot_mappings_by_layer,
+                additional_kwargs={
+                    "lvllm_moe_request_batch": lvllm_moe_request_batch,
+                },
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 model_output = self.model(**model_inputs)
