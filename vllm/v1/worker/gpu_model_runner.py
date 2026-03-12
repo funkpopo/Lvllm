@@ -3766,6 +3766,10 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        lvllm_moe_request_batch = tuple(
+            (req_id, int(num_tokens))
+            for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items()
+        )
         with (
             set_forward_context(
                 attn_metadata,
@@ -3777,6 +3781,9 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
+                additional_kwargs={
+                    "lvllm_moe_request_batch": lvllm_moe_request_batch,
+                },
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
