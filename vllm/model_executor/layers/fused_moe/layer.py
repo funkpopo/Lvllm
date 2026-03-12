@@ -428,6 +428,9 @@ class FusedMoE(CustomOp):
         self.is_gpu_prefill_layer = is_lk_moe_gpu_prefill_layer(self.layer_name)
         self.is_cpu_layer = is_lk_moe_cpu_layer(self.layer_name)
         self._lk_moe_guard = LkMoeSerialGuard()
+        self._lk_non_cudagraph_state_lock = threading.Lock()
+        self._lk_prefill_streams: dict[int, torch.cuda.Stream] = {}
+        self._lk_prefill_bsz_tensors_cpu: dict[int, torch.Tensor] = {}
         if get_gpu_prefill_min_batch_size() > vllm_config.scheduler_config.max_num_batched_tokens:
             logger.error(
                 f"gpu_prefill_min_batch_size ({get_gpu_prefill_min_batch_size()}) "
@@ -2550,6 +2553,28 @@ class FusedMoE(CustomOp):
                 torch.zeros((1), device="cpu", dtype=torch.int32, pin_memory=pin_memory, requires_grad=False).contiguous()
                 for _ in range(len(FusedMoE.cuda_graphs))
             ]
+
+    def _get_non_cudagraph_prefill_state(
+        self, current_device: int
+    ) -> tuple[torch.cuda.Stream, torch.Tensor]:
+        with self._lk_non_cudagraph_state_lock:
+            prefill_stream = self._lk_prefill_streams.get(current_device)
+            if prefill_stream is None:
+                prefill_stream = torch.cuda.Stream(device=current_device)
+                self._lk_prefill_streams[current_device] = prefill_stream
+
+            bsz_tensor_cpu = self._lk_prefill_bsz_tensors_cpu.get(current_device)
+            if bsz_tensor_cpu is None:
+                bsz_tensor_cpu = torch.zeros(
+                    (1,),
+                    device="cpu",
+                    dtype=torch.int32,
+                    pin_memory=is_pin_memory_available(),
+                    requires_grad=False,
+                ).contiguous()
+                self._lk_prefill_bsz_tensors_cpu[current_device] = bsz_tensor_cpu
+
+        return prefill_stream, bsz_tensor_cpu
          
     def _find_best_graph_index(self, total_tokens: int) -> int:
         if not hasattr(FusedMoE, 'cuda_graphs') or not FusedMoE.cuda_graphs:
@@ -2649,11 +2674,13 @@ class FusedMoE(CustomOp):
                     torch.nan_to_num(output_gpu[graph_index][:batch_size], nan=0.0, out=output_gpu[graph_index][:batch_size])
                 return output_gpu[graph_index][:batch_size]
             else:  
-                prefill_stream = torch.cuda.Stream()
+                prefill_stream, bsz_tensor = self._get_non_cudagraph_prefill_state(
+                    current_device
+                )
                         
-                current_stream = torch.cuda.current_stream()
+                caller_stream = torch.cuda.current_stream()
                 wait_event = torch.cuda.Event()
-                wait_event.record(current_stream)
+                wait_event.record(caller_stream)
                 
                 topk_ids.record_stream(prefill_stream)
                 topk_weights.record_stream(prefill_stream)
@@ -2666,12 +2693,12 @@ class FusedMoE(CustomOp):
                     weights_cpu = topk_weights.to(dtype=torch.float32, device='cpu', memory_format=torch.contiguous_format, non_blocking=non_blocking)
                     hidden_states_cpu = hidden_states.to(device='cpu', memory_format=torch.contiguous_format, non_blocking=non_blocking)
                     output_cpu = torch.empty_like(hidden_states, device='cpu', memory_format=torch.contiguous_format)
-                    bsz_tensor = torch.tensor([hidden_states.size(0)], device='cpu', dtype=torch.int32).contiguous()
                      
                     prefill_stream.synchronize()
                     with self._lk_moe_guard.acquire():
+                        bsz_tensor[0] = batch_size
                         self.lk_moe.forward(
-                            hidden_states.size(0),                         # qlen
+                            batch_size,                         # qlen
                             expert_ids_cpu.size(1),                    # k
                             expert_ids_cpu.data_ptr(),                 # expert_ids
                             weights_cpu.data_ptr(),                    # weights
@@ -2679,13 +2706,13 @@ class FusedMoE(CustomOp):
                             output_cpu.data_ptr(),                     # output 
                             bsz_tensor.data_ptr()                      # bsz_tensor
                         )     
-                    output_gpu = output_cpu.to(torch.cuda.current_device(), non_blocking=non_blocking)
+                    output_gpu = output_cpu.to(current_device, non_blocking=non_blocking)
                     if self.check_nan_in_output:
                         torch.nan_to_num(output_gpu, nan=0.0, out=output_gpu)
                     complete_event = torch.cuda.Event()
                     complete_event.record(prefill_stream)
                 
-                current_stream.wait_event(complete_event)
+                caller_stream.wait_event(complete_event)
     
                 return output_gpu
        
