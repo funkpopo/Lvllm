@@ -3,6 +3,7 @@
 
 from collections.abc import Callable, Iterable
 from enum import Enum
+import time
 from typing import Literal, cast, get_args, overload
 
 import torch
@@ -53,6 +54,10 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
+from vllm.v1.metrics.lvllm import (
+    observe_fallback_count,
+    observe_lk_moe_forward_latency_seconds,
+)
 
 logger = init_logger(__name__)
 import threading
@@ -2491,8 +2496,17 @@ class FusedMoE(CustomOp):
         import gc
         gc.collect()
         
-    def forward_lk(self, hidden_states: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
-        return self._process_valid_inputs(hidden_states, topk_weights, topk_ids)
+    def forward_lk(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        start_time = time.perf_counter()
+        try:
+            return self._process_valid_inputs(hidden_states, topk_weights, topk_ids)
+        finally:
+            observe_lk_moe_forward_latency_seconds(time.perf_counter() - start_time)
   
     def _get_max_batch_size(self) -> int:
         if self.vllm_config.speculative_config is not None and self.vllm_config.speculative_config.num_speculative_tokens > 0:
@@ -2717,7 +2731,8 @@ class FusedMoE(CustomOp):
                 return output_gpu
        
         except Exception as e:
-            logger.error(f"lk_moe forward failed with error: {e}, falling back to default path") 
+            observe_fallback_count()
+            logger.error(f"lk_moe forward failed with error: {e}, falling back to default path")
             raise RuntimeError("lk_moe forward failed, fallback to default MoE implementation")
 
 

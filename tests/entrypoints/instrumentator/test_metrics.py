@@ -225,6 +225,18 @@ EXPECTED_METRICS_V1 = [
     "vllm:request_decode_time_seconds_sum",
     "vllm:request_decode_time_seconds_bucket",
     "vllm:request_decode_time_seconds_count",
+    "vllm:lvllm_lk_moe_forward_latency_seconds_sum",
+    "vllm:lvllm_lk_moe_forward_latency_seconds_bucket",
+    "vllm:lvllm_lk_moe_forward_latency_seconds_count",
+    "vllm:lvllm_gpu_prefetch_bytes_total",
+    "vllm:lvllm_gpu_prefetch_wait_seconds_sum",
+    "vllm:lvllm_gpu_prefetch_wait_seconds_bucket",
+    "vllm:lvllm_gpu_prefetch_wait_seconds_count",
+    "vllm:lvllm_gpu_prefetch_active_layers",
+    "vllm:lvllm_cpu_moe_tokens_total",
+    "vllm:lvllm_gpu_resident_moe_tokens_total",
+    "vllm:lvllm_fallback_count_total",
+    "vllm:lvllm_numa_node_plan",
 ]
 
 EXPECTED_METRICS_MM = [
